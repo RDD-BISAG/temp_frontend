@@ -3,14 +3,34 @@ import sys
 import time
 import csv
 import json
+import base64
 import datetime
 import tempfile
 import logging
 import collections
+import asyncio
 import cv2
 import numpy as np
 import pandas as pd
 import gradio as gr
+
+# Silence WinError 10054 ConnectionResetError noise on Windows asyncio event loops
+if sys.platform == "win32":
+    try:
+        def _silence_win_connection_reset(loop, context):
+            exception = context.get("exception")
+            if isinstance(exception, ConnectionResetError):
+                return
+            loop.default_exception_handler(context)
+
+        try:
+            loop = asyncio.get_event_loop_policy().get_event_loop()
+            if loop and not loop.is_closed():
+                loop.set_exception_handler(_silence_win_connection_reset)
+        except Exception:
+            pass
+    except Exception:
+        pass
 
 # Try importing psutil for CPU & RAM system hardware monitoring
 try:
@@ -35,6 +55,7 @@ if BASE_DIR not in sys.path:
 try:
     from rdd_dedup.pipeline import RDDPipeline
     from rdd_dedup.config import PipelineConfig
+    from rdd_dedup.tracking.defect_track import FinalizedDefect, PipelineResult
     HAS_DEDUP_PIPELINE = True
 except ImportError as e:
     print(f"[Warning] rdd_dedup pipeline not available: {e}")
@@ -126,6 +147,16 @@ _ANNOTATION_STATE = {
     "last_pipeline_result": None,
     "last_video_path": None,
 }
+
+# Global flag to signal cancellation / revocation of ongoing video processing
+_CANCEL_FLAG = {"requested": False}
+
+
+def revoke_processing():
+    """Sets the revocation request flag to cancel active backend video processing."""
+    _CANCEL_FLAG["requested"] = True
+    return "⚠️ **Process Revocation Requested**: Terminating active backend video processing task..."
+
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -296,20 +327,25 @@ def update_system_dashboard():
     ram_color = "#ef4444" if ram["percent"] > 85 else "#f97316" if ram["percent"] > 60 else "#10b981"
     
     cards_html = f"""
-    <div style="display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; background: #1e293b; border: 1px solid #334155; border-radius: 8px; padding: 6px 12px; margin-bottom: 6px;">
-        <div style="font-size: 0.8rem; font-weight: 700; color: #f8fafc; display: flex; align-items: center; gap: 6px;">
-            <span> CPU:</span> <span style="color: {cpu_color}; font-size: 0.95rem; font-weight: 800;">{cpu['percent']}%</span>
-            <span style="color: #94a3b8; font-weight: normal; font-size: 0.72rem;">({cpu['cores']}C/{cpu['threads']}T)</span>
+    <div class="sys-bar">
+        <div class="sys-metric">
+            <span class="label">⚡ CPU</span>
+            <span class="value" style="color: {cpu_color};">{cpu['percent']}%</span>
+            <div class="progress-bar"><div class="progress-fill" style="width: {min(100, cpu['percent'])}%; background: {cpu_color};"></div></div>
+            <span class="detail">{cpu['cores']}C / {cpu['threads']}T</span>
         </div>
-        <div style="font-size: 0.8rem; font-weight: 700; color: #f8fafc; display: flex; align-items: center; gap: 6px;">
-            <span>🧠 RAM:</span> <span style="color: {ram_color}; font-size: 0.95rem; font-weight: 800;">{ram['percent']}%</span>
-            <span style="color: #94a3b8; font-weight: normal; font-size: 0.72rem;">({ram['used_gb']}/{ram['total_gb']} GB)</span>
+        <div class="sys-metric">
+            <span class="label">🧠 RAM</span>
+            <span class="value" style="color: {ram_color};">{ram['percent']}%</span>
+            <div class="progress-bar"><div class="progress-fill" style="width: {min(100, ram['percent'])}%; background: {ram_color};"></div></div>
+            <span class="detail">{ram['used_gb']} / {ram['total_gb']} GB</span>
         </div>
-        <div style="font-size: 0.8rem; font-weight: 700; color: #f8fafc; display: flex; align-items: center; gap: 6px;">
-            <span>🎮 GPU:</span> <span style="color: #38bdf8; font-size: 0.8rem;">{gpu['name']}</span>
+        <div class="sys-metric">
+            <span class="label">🎮 GPU</span>
+            <span class="value" style="color: #38bdf8; font-size: 0.8rem;">{gpu['name']}</span>
         </div>
-        <div style="font-size: 0.75rem; color: #94a3b8;">
-            ⏱️ {uptime_min}m {uptime_sec}s
+        <div class="sys-metric">
+            <span class="detail">⏱️ {uptime_min}m {uptime_sec}s</span>
         </div>
     </div>
     """
@@ -328,24 +364,7 @@ def get_available_models():
                     rel_path = os.path.relpath(os.path.join(root, file), MODELS_DIR)
                     rel_path = rel_path.replace("\\", "/")
                     model_files.append(rel_path)
-
-    # Sort with priority to rdd2022_st1, rdd_yolo, rdd2022
-    def model_priority(name):
-        lower = name.lower()
-        if "rdd2022_st2" in lower:
-            return 0
-        if "rdd2022_st1" in lower:
-            return 1
-        if "rdd_yolo.pt" in lower and "/" not in lower:
-            return 2
-        if "rdd2022" in lower:
-            return 3
-        if "rdd" in lower:
-            return 4
-        return 10
-
-    model_files.sort(key=model_priority)
-
+                    
     if not model_files:
         model_files = ["rdd_yolo.pt (Default)", "yolov8n.pt (Baseline)", "Demo / Simulation Mode"]
     else:
@@ -488,6 +507,7 @@ def estimate_video_info(video_path, frame_skip=1):
     if not video_path or not os.path.exists(video_path):
         return ""
 
+    cap = None
     try:
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
@@ -497,7 +517,6 @@ def estimate_video_info(video_path, frame_skip=1):
         fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        cap.release()
 
         if total_frames <= 0:
             return ""
@@ -525,6 +544,12 @@ def estimate_video_info(video_path, frame_skip=1):
         )
     except Exception:
         return ""
+    finally:
+        if cap is not None:
+            try:
+                cap.release()
+            except Exception:
+                pass
 
 
 def compute_live_eta(fraction, start_time):
@@ -552,18 +577,42 @@ def compute_live_eta(fraction, start_time):
 def reencode_to_h264(input_path, output_path):
     """Re-encodes video to H.264 format using imageio-ffmpeg for browser compatibility."""
     if HAS_IMAGEIO_FFMPEG:
+        reader = None
+        writer = None
         try:
             reader = imageio.get_reader(input_path)
             fps = reader.get_meta_data().get('fps', 30)
             writer = imageio.get_writer(output_path, fps=fps, codec='libx264', pixelformat='yuv420p')
             for frame in reader:
                 writer.append_data(frame)
-            writer.close()
-            reader.close()
             return output_path
         except Exception as e:
             print(f"[Warning] H.264 re-encoding failed: {e}")
+        finally:
+            if writer is not None:
+                try:
+                    writer.close()
+                except Exception:
+                    pass
+            if reader is not None:
+                try:
+                    reader.close()
+                except Exception:
+                    pass
     return input_path
+
+
+def on_toggle_dedup(enabled):
+    """Event handler when the user toggles duplicate removal ON/OFF."""
+    if enabled:
+        status_html = '<div class="dedup-active"><span class="dedup-dot dedup-dot-on"></span> Dedup Pipeline — ACTIVE <span style="font-weight:400; color:#94a3b8; font-size:0.8rem;">· BoT-SORT + Multi-Feature Verification</span></div>'
+        btn_label = "🚀 Run RDD-YOLO Detection + Dedup"
+        row_visibility = gr.update(visible=True)
+    else:
+        status_html = '<div class="dedup-inactive"><span class="dedup-dot dedup-dot-off"></span> Dedup Pipeline — OFF <span style="font-weight:400; color:#94a3b8; font-size:0.8rem;">· Raw Frame-by-Frame Detection</span></div>'
+        btn_label = "🚀 Run RDD-YOLO Detection (Raw Mode)"
+        row_visibility = gr.update(visible=False)
+    return status_html, btn_label, row_visibility
 
 
 def process_video(video_path, model_name, conf_threshold, iou_threshold, frame_skip,
@@ -587,6 +636,9 @@ def process_video(video_path, model_name, conf_threshold, iou_threshold, frame_s
     """
     if not video_path or not os.path.exists(video_path):
         return None, None, [], "❌ Error: Invalid or missing video input file."
+
+    # Reset revocation flag for new processing session
+    _CANCEL_FLAG["requested"] = False
 
     # ── Dedup Pipeline Path ──
     if enable_dedup and HAS_DEDUP_PIPELINE and "Demo" not in model_name:
@@ -655,8 +707,13 @@ def _process_video_with_dedup(video_path, model_name, conf_threshold, iou_thresh
             video_path,
             output_dir=OUTPUTS_DIR,
             progress_callback=gradio_progress_callback,
+            cancel_check=lambda: _CANCEL_FLAG["requested"],
         )
+    except InterruptedError as e:
+        return None, None, [], f"⚠️ **Process Revoked**: {e}"
     except Exception as e:
+        if _CANCEL_FLAG["requested"]:
+            return None, None, [], "⚠️ **Process Revoked**: Video processing was cancelled by user revocation request."
         import traceback
         traceback.print_exc()
         return None, None, [], f"❌ Pipeline error: {e}"
@@ -664,6 +721,7 @@ def _process_video_with_dedup(video_path, model_name, conf_threshold, iou_thresh
     # Store result for dataset builder
     _ANNOTATION_STATE["last_pipeline_result"] = result
     _ANNOTATION_STATE["last_video_path"] = video_path
+    _ANNOTATION_STATE["last_inspection_mode"] = "dedup"
 
     # ── Convert outputs to Gradio format ──
 
@@ -764,14 +822,15 @@ def _process_video_with_dedup(video_path, model_name, conf_threshold, iou_thresh
 
 def prepare_annotation_candidates():
     """
-    Extract annotation candidates from the last pipeline run.
+    Extract annotation candidates from the last video inspection run (supports Dedup and Raw Mode).
     Returns: (status_message, total_count)
     """
     result = _ANNOTATION_STATE.get("last_pipeline_result")
     video_path = _ANNOTATION_STATE.get("last_video_path")
+    mode = _ANNOTATION_STATE.get("last_inspection_mode", "dedup")
 
     if result is None or video_path is None:
-        return "❌ No pipeline result available. Run a video inspection first on the '🚀 Run New Inspection' tab.", 0
+        return "❌ No inspection result available. Run a video inspection first on the '🚀 Run New Inspection' tab.", 0
 
     if not HAS_DATASET_SYSTEM or RDD_CROP_SELECTOR is None:
         return "❌ Dataset system not available. Check configs/rdd_ahmedabad_classes.yaml.", 0
@@ -779,7 +838,7 @@ def prepare_annotation_candidates():
     candidates = RDD_CROP_SELECTOR.select_from_pipeline_result(result, video_path)
 
     if not candidates:
-        return "⚠️ No annotation candidates found. The pipeline may not have detected any defects.", 0
+        return "⚠️ No annotation candidates found. The inspection did not detect any defects.", 0
 
     _ANNOTATION_STATE["candidates"] = candidates
     _ANNOTATION_STATE["current_index"] = 0
@@ -787,7 +846,8 @@ def prepare_annotation_candidates():
     _ANNOTATION_STATE["skipped_count"] = 0
     _ANNOTATION_STATE["changed_count"] = 0
 
-    return f"✅ {len(candidates)} unique defect crops ready for review.", len(candidates)
+    mode_label = "Deduplicated" if mode == "dedup" else "Raw Detections (No Dedup)"
+    return f"✅ {len(candidates)} defect crops ready for review ({mode_label}).", len(candidates)
 
 
 def get_current_candidate_display():
@@ -825,6 +885,10 @@ def get_current_candidate_display():
     suggested = c.class_name
     if RDD_CLASS_CONFIG:
         suggested = RDD_CLASS_CONFIG.map_model_class(c.predicted_class)
+    
+    # Ensure uppercase matching dropdown options
+    if isinstance(suggested, str):
+        suggested = suggested.upper()
 
     info_md = f"""
 ### Detection #{idx + 1} / {len(candidates)}
@@ -932,6 +996,395 @@ def get_dataset_stats_md():
     return "Dataset system not initialized."
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# Crop Box Adjustment — Backend Helpers
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _get_current_candidate():
+    """Return the current CandidateAnnotation or None."""
+    candidates = _ANNOTATION_STATE.get("candidates", [])
+    idx = _ANNOTATION_STATE.get("current_index", 0)
+    if not candidates or idx >= len(candidates):
+        return None
+    return candidates[idx]
+
+
+def draw_bbox_on_frame(frame_rgb, bbox, color=(0, 255, 0), thickness=3):
+    """
+    Draw a bounding box overlay on a copy of the frame (RGB format).
+    Returns the annotated frame image (RGB, numpy array).
+    """
+    if frame_rgb is None:
+        return None
+    annotated = frame_rgb.copy()
+    x1, y1, x2, y2 = [int(v) for v in bbox]
+    cv2.rectangle(annotated, (x1, y1), (x2, y2), color, thickness)
+    # Draw corner markers for better visibility
+    corner_len = min(20, (x2 - x1) // 4, (y2 - y1) // 4)
+    corner_color = (255, 165, 0)  # Orange corners
+    # Top-left
+    cv2.line(annotated, (x1, y1), (x1 + corner_len, y1), corner_color, thickness + 1)
+    cv2.line(annotated, (x1, y1), (x1, y1 + corner_len), corner_color, thickness + 1)
+    # Top-right
+    cv2.line(annotated, (x2, y1), (x2 - corner_len, y1), corner_color, thickness + 1)
+    cv2.line(annotated, (x2, y1), (x2, y1 + corner_len), corner_color, thickness + 1)
+    # Bottom-left
+    cv2.line(annotated, (x1, y2), (x1 + corner_len, y2), corner_color, thickness + 1)
+    cv2.line(annotated, (x1, y2), (x1, y2 - corner_len), corner_color, thickness + 1)
+    # Bottom-right
+    cv2.line(annotated, (x2, y2), (x2 - corner_len, y2), corner_color, thickness + 1)
+    cv2.line(annotated, (x2, y2), (x2, y2 - corner_len), corner_color, thickness + 1)
+    # Label
+    label = f"({x1},{y1}) - ({x2},{y2})"
+    cv2.putText(annotated, label, (x1, max(y1 - 8, 15)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
+    return annotated
+
+
+def _get_frame_rgb_for_candidate(candidate):
+    """Get the RGB frame for a candidate, fetching from video if needed."""
+    if candidate is None:
+        return None
+    frame_bgr = candidate.original_frame
+    if frame_bgr is None:
+        # Try to fetch from video
+        video_path = _ANNOTATION_STATE.get("last_video_path")
+        if video_path and os.path.exists(video_path) and candidate.frame_number > 0:
+            cap = None
+            try:
+                cap = cv2.VideoCapture(video_path)
+                if cap.isOpened():
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, candidate.frame_number - 1)
+                    ret, frame = cap.read()
+                    if ret and frame is not None:
+                        candidate.original_frame = frame.copy()
+                        frame_bgr = frame
+            except Exception:
+                pass
+            finally:
+                if cap is not None:
+                    try:
+                        cap.release()
+                    except Exception:
+                        pass
+    if frame_bgr is None:
+        return None
+    return cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+
+
+def _encode_frame_base64(frame_rgb):
+    """Encode an RGB frame to base64 JPEG for HTML canvas embedding."""
+    if frame_rgb is None:
+        return None
+    frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+    _, buffer = cv2.imencode('.jpg', frame_bgr, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    return base64.b64encode(buffer).decode('utf-8')
+
+
+def render_bbox_editor_html(frame_rgb, bbox, canvas_id="bbox_canvas"):
+    """
+    Render an interactive HTML5 canvas with draggable bounding box corners.
+    The user can drag corner handles, edge midpoints, or move the entire box.
+    On release, the JS auto-updates the Gradio X1/Y1/X2/Y2 Number inputs.
+    """
+    if frame_rgb is None:
+        return '<div style="text-align:center;color:#94a3b8;padding:40px;font-family:Inter,sans-serif;">No frame loaded. Click ✏️ Adjust Crop to load the source frame.</div>'
+
+    b64_str = _encode_frame_base64(frame_rgb)
+    if b64_str is None:
+        return '<div style="text-align:center;color:#94a3b8;padding:40px;">Failed to encode frame.</div>'
+
+    x1, y1, x2, y2 = [int(v) for v in bbox]
+
+    # Build the inner HTML document for the iframe srcdoc.
+    # Gradio 5+/6+ sanitizes <script> tags in gr.HTML, so we must use an
+    # <iframe srcdoc> to get JavaScript execution for the interactive canvas.
+    inner_html = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<style>
+  html, body {{ margin:0; padding:0; background:transparent; overflow:hidden; }}
+  canvas {{ display:block; max-width:100%; border-radius:8px; border:1px solid rgba(255,255,255,0.08); }}
+  .hint {{ text-align:center; padding:6px 0; font-size:0.78rem; color:#94a3b8; font-family:Inter,sans-serif; }}
+</style>
+</head><body>
+<canvas id="cv"></canvas>
+<div class="hint">🟠 Drag corners to resize &nbsp;·&nbsp; Drag inside box to move &nbsp;·&nbsp; Click 📐 Apply to update crop</div>
+<script>
+(function() {{
+  const C = document.getElementById('cv');
+  if (!C) return;
+  const ctx = C.getContext('2d');
+  const img = new Image();
+  img.src = 'data:image/jpeg;base64,{b64_str}';
+
+  let box = {{ x1:{x1}, y1:{y1}, x2:{x2}, y2:{y2} }};
+  let drag = null;
+  let ds = {{ x:0, y:0 }};
+  let sc = 1;
+
+  function resizeIframe() {{
+    try {{
+      const h = document.documentElement.scrollHeight;
+      if (window.frameElement) window.frameElement.style.height = h + 'px';
+    }} catch(e) {{}}
+  }}
+
+  img.onload = function() {{
+    const maxW = Math.min(780, (C.parentElement ? C.parentElement.clientWidth : 780) - 2);
+    sc = maxW / img.width;
+    C.width = Math.round(img.width * sc);
+    C.height = Math.round(img.height * sc);
+    paint();
+    resizeIframe();
+  }};
+
+  function paint() {{
+    ctx.clearRect(0,0,C.width,C.height);
+    ctx.drawImage(img,0,0,C.width,C.height);
+    const sx1=box.x1*sc, sy1=box.y1*sc, sx2=box.x2*sc, sy2=box.y2*sc;
+    const bw=sx2-sx1, bh=sy2-sy1;
+
+    // Dim area outside box
+    ctx.fillStyle='rgba(0,0,0,0.45)';
+    ctx.fillRect(0,0,C.width,sy1);
+    ctx.fillRect(0,sy2,C.width,C.height-sy2);
+    ctx.fillRect(0,sy1,sx1,bh);
+    ctx.fillRect(sx2,sy1,C.width-sx2,bh);
+
+    // Box border
+    ctx.strokeStyle='#22c55e'; ctx.lineWidth=2;
+    ctx.strokeRect(sx1,sy1,bw,bh);
+
+    // Corner handles
+    const hs=10;
+    ctx.fillStyle='#f97316';
+    [[sx1,sy1],[sx2,sy1],[sx1,sy2],[sx2,sy2]].forEach(function(p){{
+      ctx.fillRect(p[0]-hs/2,p[1]-hs/2,hs,hs);
+    }});
+
+    // Edge midpoint handles
+    ctx.fillStyle='#38bdf8';
+    const emid=7;
+    [[sx1+bw/2,sy1],[sx1+bw/2,sy2],[sx1,sy1+bh/2],[sx2,sy1+bh/2]].forEach(function(p){{
+      ctx.beginPath(); ctx.arc(p[0],p[1],emid/2,0,Math.PI*2); ctx.fill();
+    }});
+
+    // Coordinate label
+    ctx.fillStyle='#22c55e'; ctx.font='bold 11px monospace';
+    ctx.fillText('('+Math.round(box.x1)+','+Math.round(box.y1)+') - ('+Math.round(box.x2)+','+Math.round(box.y2)+')', sx1, Math.max(sy1-6,13));
+
+    // Size label
+    const ww=Math.round(box.x2-box.x1), hh=Math.round(box.y2-box.y1);
+    ctx.fillStyle='rgba(0,0,0,0.7)'; ctx.fillRect(sx1,sy2+4,90,18); ctx.fillStyle='#f1f5f9'; ctx.font='11px monospace';
+    ctx.fillText(ww+'x'+hh+'px', sx1+4, sy2+16);
+  }}
+
+  function mpos(e) {{
+    const r=C.getBoundingClientRect();
+    return {{ x:e.clientX-r.left, y:e.clientY-r.top }};
+  }}
+
+  function hit(p) {{
+    const g=14;
+    const sx1=box.x1*sc, sy1=box.y1*sc, sx2=box.x2*sc, sy2=box.y2*sc;
+    const mx=(sx1+sx2)/2, my=(sy1+sy2)/2;
+    if(Math.abs(p.x-sx1)<g && Math.abs(p.y-sy1)<g) return 'tl';
+    if(Math.abs(p.x-sx2)<g && Math.abs(p.y-sy1)<g) return 'tr';
+    if(Math.abs(p.x-sx1)<g && Math.abs(p.y-sy2)<g) return 'bl';
+    if(Math.abs(p.x-sx2)<g && Math.abs(p.y-sy2)<g) return 'br';
+    if(Math.abs(p.x-mx)<g && Math.abs(p.y-sy1)<g) return 'mt';
+    if(Math.abs(p.x-mx)<g && Math.abs(p.y-sy2)<g) return 'mb';
+    if(Math.abs(p.x-sx1)<g && Math.abs(p.y-my)<g) return 'ml';
+    if(Math.abs(p.x-sx2)<g && Math.abs(p.y-my)<g) return 'mr';
+    if(p.x>sx1 && p.x<sx2 && p.y>sy1 && p.y<sy2) return 'mv';
+    return null;
+  }}
+
+  const cursors = {{tl:'nwse-resize',br:'nwse-resize',tr:'nesw-resize',bl:'nesw-resize',mt:'ns-resize',mb:'ns-resize',ml:'ew-resize',mr:'ew-resize',mv:'move'}};
+
+  C.addEventListener('mousedown',function(e){{
+    const p=mpos(e); drag=hit(p); ds=p; e.preventDefault();
+  }});
+
+  C.addEventListener('mousemove',function(e){{
+    const p=mpos(e);
+    const h=hit(p); C.style.cursor=h?cursors[h]||'crosshair':'crosshair';
+    if(!drag) return;
+    const dx=(p.x-ds.x)/sc, dy=(p.y-ds.y)/sc;
+    if(drag==='tl'){{ box.x1+=dx; box.y1+=dy; }}
+    else if(drag==='tr'){{ box.x2+=dx; box.y1+=dy; }}
+    else if(drag==='bl'){{ box.x1+=dx; box.y2+=dy; }}
+    else if(drag==='br'){{ box.x2+=dx; box.y2+=dy; }}
+    else if(drag==='mt'){{ box.y1+=dy; }}
+    else if(drag==='mb'){{ box.y2+=dy; }}
+    else if(drag==='ml'){{ box.x1+=dx; }}
+    else if(drag==='mr'){{ box.x2+=dx; }}
+    else if(drag==='mv'){{ box.x1+=dx; box.y1+=dy; box.x2+=dx; box.y2+=dy; }}
+    box.x1=Math.max(0,Math.min(box.x1,img.width));
+    box.y1=Math.max(0,Math.min(box.y1,img.height));
+    box.x2=Math.max(0,Math.min(box.x2,img.width));
+    box.y2=Math.max(0,Math.min(box.y2,img.height));
+    ds=p; paint();
+  }});
+
+  function endDrag(){{
+    if(!drag) return;
+    drag=null;
+    if(box.x1>box.x2){{ let t=box.x1; box.x1=box.x2; box.x2=t; }}
+    if(box.y1>box.y2){{ let t=box.y1; box.y1=box.y2; box.y2=t; }}
+    paint(); syncGradio();
+  }}
+  C.addEventListener('mouseup', endDrag);
+  C.addEventListener('mouseleave', endDrag);
+
+  function syncGradio(){{
+    // Reach into parent document (Gradio page) to update the number inputs
+    var pwin;
+    try {{ pwin = window.parent; }} catch(e) {{ pwin = window; }}
+    var pdoc = pwin.document;
+    function setN(eid, v){{
+      var el = pdoc.getElementById(eid);
+      if(!el) return;
+      var inp = el.querySelector('input[type="number"]');
+      if(!inp) return;
+      var s = Object.getOwnPropertyDescriptor(pwin.HTMLInputElement.prototype,'value');
+      if(s && s.set) {{ s.set.call(inp, Math.round(v)); }}
+      else {{ inp.value = Math.round(v); }}
+      inp.dispatchEvent(new Event('input',{{bubbles:true}}));
+      inp.dispatchEvent(new Event('change',{{bubbles:true}}));
+    }}
+    setN('ds_bbox_x1', box.x1);
+    setN('ds_bbox_y1', box.y1);
+    setN('ds_bbox_x2', box.x2);
+    setN('ds_bbox_y2', box.y2);
+  }}
+}})();
+</script>
+</body></html>"""
+
+    # Escape for safe embedding in srcdoc attribute (double-quotes → &quot;)
+    escaped_html = inner_html.replace('&', '&amp;').replace('"', '&quot;')
+
+    return f"""<iframe srcdoc="{escaped_html}" sandbox="allow-scripts allow-same-origin" style="width:100%;border:none;min-height:400px;overflow:hidden;border-radius:8px;" scrolling="no"></iframe>"""
+
+
+def get_full_frame_with_overlay():
+    """
+    Get the current candidate's full source frame as interactive canvas HTML.
+    Returns: (canvas_html, x1, y1, x2, y2) or (placeholder_html, 0, 0, 0, 0)
+    """
+    c = _get_current_candidate()
+    if c is None:
+        return render_bbox_editor_html(None, (0,0,0,0)), 0, 0, 0, 0
+    frame_rgb = _get_frame_rgb_for_candidate(c)
+    if frame_rgb is None:
+        return render_bbox_editor_html(None, (0,0,0,0)), 0, 0, 0, 0
+    x1, y1, x2, y2 = c.bbox
+    html = render_bbox_editor_html(frame_rgb, c.bbox)
+    return html, int(x1), int(y1), int(x2), int(y2)
+
+
+def adjust_bbox_with_padding(padding_px):
+    """
+    Expand the current candidate's bbox by padding_px pixels on all sides.
+    Updates the candidate's bbox and crop_image in place.
+    Returns: (crop_rgb, canvas_html, x1, y1, x2, y2)
+    """
+    c = _get_current_candidate()
+    if c is None:
+        return None, render_bbox_editor_html(None, (0,0,0,0)), 0, 0, 0, 0
+
+    frame_rgb = _get_frame_rgb_for_candidate(c)
+    if frame_rgb is None:
+        return None, render_bbox_editor_html(None, (0,0,0,0)), 0, 0, 0, 0
+
+    h, w = frame_rgb.shape[:2]
+    ix1, iy1, ix2, iy2 = c.initial_bbox
+    padding = int(padding_px)
+
+    # Expand from initial bbox
+    nx1 = max(0, ix1 - padding)
+    ny1 = max(0, iy1 - padding)
+    nx2 = min(w, ix2 + padding)
+    ny2 = min(h, iy2 + padding)
+
+    if nx2 <= nx1 or ny2 <= ny1:
+        return None, render_bbox_editor_html(None, (0,0,0,0)), 0, 0, 0, 0
+
+    new_bbox = (nx1, ny1, nx2, ny2)
+    c.bbox = new_bbox
+
+    # Re-extract crop from BGR frame
+    frame_bgr = c.original_frame
+    new_crop = frame_bgr[ny1:ny2, nx1:nx2].copy()
+    c.crop_image = new_crop
+
+    crop_rgb = cv2.cvtColor(new_crop, cv2.COLOR_BGR2RGB)
+    html = render_bbox_editor_html(frame_rgb, new_bbox)
+    return crop_rgb, html, nx1, ny1, nx2, ny2
+
+
+def apply_bbox_coord_adjustment(x1, y1, x2, y2):
+    """
+    Apply fine-tuned bbox coordinates to the current candidate.
+    Returns: (crop_rgb, canvas_html)
+    """
+    c = _get_current_candidate()
+    if c is None:
+        return None, render_bbox_editor_html(None, (0,0,0,0))
+
+    frame_rgb = _get_frame_rgb_for_candidate(c)
+    if frame_rgb is None:
+        return None, render_bbox_editor_html(None, (0,0,0,0))
+
+    h, w = frame_rgb.shape[:2]
+    nx1 = max(0, int(x1))
+    ny1 = max(0, int(y1))
+    nx2 = min(w, int(x2))
+    ny2 = min(h, int(y2))
+
+    if nx2 <= nx1 or ny2 <= ny1:
+        return None, render_bbox_editor_html(None, (0,0,0,0))
+
+    new_bbox = (nx1, ny1, nx2, ny2)
+    c.bbox = new_bbox
+
+    # Re-extract crop from BGR frame
+    frame_bgr = c.original_frame
+    new_crop = frame_bgr[ny1:ny2, nx1:nx2].copy()
+    c.crop_image = new_crop
+
+    crop_rgb = cv2.cvtColor(new_crop, cv2.COLOR_BGR2RGB)
+    html = render_bbox_editor_html(frame_rgb, new_bbox)
+    return crop_rgb, html
+
+
+def reset_bbox_to_original():
+    """
+    Reset the current candidate's bbox to its original detection coordinates.
+    Returns: (crop_rgb, canvas_html, x1, y1, x2, y2, padding_value)
+    """
+    c = _get_current_candidate()
+    if c is None:
+        return None, render_bbox_editor_html(None, (0,0,0,0)), 0, 0, 0, 0, 0
+
+    frame_rgb = _get_frame_rgb_for_candidate(c)
+    if frame_rgb is None:
+        return None, render_bbox_editor_html(None, (0,0,0,0)), 0, 0, 0, 0, 0
+
+    ix1, iy1, ix2, iy2 = c.initial_bbox
+    c.bbox = c.initial_bbox
+
+    # Re-extract crop from BGR frame
+    frame_bgr = c.original_frame
+    new_crop = frame_bgr[iy1:iy2, ix1:ix2].copy()
+    c.crop_image = new_crop
+
+    crop_rgb = cv2.cvtColor(new_crop, cv2.COLOR_BGR2RGB)
+    html = render_bbox_editor_html(frame_rgb, c.initial_bbox)
+    return crop_rgb, html, ix1, iy1, ix2, iy2, 0
+
+
 def _process_video_legacy(video_path, model_name, conf_threshold, iou_threshold,
                           frame_skip, progress):
     """
@@ -992,67 +1445,115 @@ def _process_video_legacy(video_path, model_name, conf_threshold, iou_threshold,
 
     progress(0, desc=f"Loading RDD-YOLO Model ({model_name})...")
 
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
-            break
+    try:
+        while cap.isOpened():
+            if _CANCEL_FLAG["requested"]:
+                print("[RDD UI] Video processing revoked by user.")
+                return None, None, [], "⚠️ **Process Revoked**: Video processing was cancelled by user revocation request."
 
-        frame_index += 1
-        if (frame_index - 1) % frame_skip != 0:
-            continue
+            ret, frame = cap.read()
+            if not ret:
+                break
 
-        processed_count += 1
-        current_frame_detections = 0
-        timestamp_sec = round(frame_index / fps, 2)
+            frame_index += 1
+            if (frame_index - 1) % frame_skip != 0:
+                continue
 
-        # Raw frame copy for clean crops
-        clean_frame = frame.copy()
+            processed_count += 1
+            current_frame_detections = 0
+            timestamp_sec = round(frame_index / fps, 2)
 
-        # Perform inference using RDD-YOLO
-        if model is not None:
-            results = model.predict(frame, conf=conf_threshold, iou=iou_threshold, verbose=False)
-            for r in results:
-                boxes = r.boxes
-                for box in boxes:
-                    cls_id = int(box.cls[0].item())
+            # Raw frame copy for clean crops
+            clean_frame = frame.copy()
 
-                    conf = float(box.conf[0].item())
-                    xyxy = box.xyxy[0].cpu().numpy().astype(int)
-                    # Map class info dynamically
-                    cls_cfg = class_map.get(cls_id, {"name": f"Class-{cls_id}", "color": (0, 0, 255)})
-                    cls_name = cls_cfg["name"]
+            # Perform inference using RDD-YOLO
+            if model is not None:
+                results = model.predict(frame, conf=conf_threshold, iou=iou_threshold, verbose=False)
+                for r in results:
+                    boxes = r.boxes
+                    for box in boxes:
+                        cls_id = int(box.cls[0].item())
+
+                        conf = float(box.conf[0].item())
+                        xyxy = box.xyxy[0].cpu().numpy().astype(int)
+                        # Map class info dynamically
+                        cls_cfg = class_map.get(cls_id, {"name": f"Class-{cls_id}", "color": (0, 0, 255)})
+                        cls_name = cls_cfg["name"]
+                        color = cls_cfg["color"]
+
+                        # Coordinates
+                        x1, y1, x2, y2 = xyxy
+                        x1_c, y1_c = max(0, x1), max(0, y1)
+                        x2_c, y2_c = min(width, x2), min(height, y2)
+
+                        total_detections += 1
+                        current_frame_detections += 1
+                        class_counts[cls_name] = class_counts.get(cls_name, 0) + 1
+
+                        # Save Cropped Defect Patch
+                        crop_filename = f"crop_frame{frame_index:04d}_det{total_detections:03d}_{cls_id}_{conf:.2f}.jpg"
+                        crop_filepath = os.path.join(crops_dir, crop_filename)
+
+                        if x2_c > x1_c and y2_c > y1_c:
+                            crop_patch = clean_frame[y1_c:y2_c, x1_c:x2_c]
+                            cv2.imwrite(crop_filepath, crop_patch)
+
+                            # Add to UI gallery (up to 60 crops max for fast UI rendering)
+                            if len(crop_gallery_images) < 60:
+                                crop_rgb = cv2.cvtColor(crop_patch, cv2.COLOR_BGR2RGB)
+                                crop_gallery_images.append((crop_rgb, f"{cls_name} ({conf:.2f}) - t={timestamp_sec}s"))
+
+                        # Record to CSV
+                        csv_records.append({
+                            "detection_id": total_detections,
+                            "frame_index": frame_index,
+                            "timestamp_sec": timestamp_sec,
+                            "class_id": cls_id,
+                            "class_name": cls_name,
+                            "confidence": round(conf, 4),
+                            "bbox_x1": x1,
+                            "bbox_y1": y1,
+                            "bbox_x2": x2,
+                            "bbox_y2": y2,
+                            "crop_filename": crop_filename
+                        })
+
+                        # Draw Bounding Box & Label on Output Frame
+                        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                        label_str = f"{cls_name} {conf:.2f}"
+                        (w, h), _ = cv2.getTextSize(label_str, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+                        cv2.rectangle(frame, (x1, max(0, y1 - 20)), (x1 + w + 10, y1), color, -1)
+                        cv2.putText(frame, label_str, (x1 + 5, max(12, y1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+
+            else:
+                # Demo / Simulation Mode HUD & Crops
+                if (frame_index // 15) % 3 == 1:
+                    x1, y1 = int(width * 0.35), int(height * 0.65)
+                    x2, y2 = int(width * 0.55), int(height * 0.85)
+                    cls_cfg = DEFAULT_RDD_CLASSES[3]  # Pothole
                     color = cls_cfg["color"]
-
-                    # Coordinates
-                    x1, y1, x2, y2 = xyxy
-                    x1_c, y1_c = max(0, x1), max(0, y1)
-                    x2_c, y2_c = min(width, x2), min(height, y2)
 
                     total_detections += 1
                     current_frame_detections += 1
-                    class_counts[cls_name] = class_counts.get(cls_name, 0) + 1
+                    class_counts[cls_cfg["name"]] = class_counts.get(cls_cfg["name"], 0) + 1
 
-                    # Save Cropped Defect Patch
-                    crop_filename = f"crop_frame{frame_index:04d}_det{total_detections:03d}_{cls_id}_{conf:.2f}.jpg"
+                    crop_filename = f"crop_frame{frame_index:04d}_det{total_detections:03d}_3_0.89.jpg"
                     crop_filepath = os.path.join(crops_dir, crop_filename)
 
-                    if x2_c > x1_c and y2_c > y1_c:
-                        crop_patch = clean_frame[y1_c:y2_c, x1_c:x2_c]
+                    crop_patch = clean_frame[y1:y2, x1:x2]
+                    if crop_patch.size > 0:
                         cv2.imwrite(crop_filepath, crop_patch)
-
-                        # Add to UI gallery (up to 60 crops max for fast UI rendering)
                         if len(crop_gallery_images) < 60:
                             crop_rgb = cv2.cvtColor(crop_patch, cv2.COLOR_BGR2RGB)
-                            crop_gallery_images.append((crop_rgb, f"{cls_name} ({conf:.2f}) - t={timestamp_sec}s"))
+                            crop_gallery_images.append((crop_rgb, f"{cls_cfg['name']} (0.89 Demo)"))
 
-                    # Record to CSV
                     csv_records.append({
                         "detection_id": total_detections,
                         "frame_index": frame_index,
                         "timestamp_sec": timestamp_sec,
-                        "class_id": cls_id,
-                        "class_name": cls_name,
-                        "confidence": round(conf, 4),
+                        "class_id": 3,
+                        "class_name": cls_cfg["name"],
+                        "confidence": 0.89,
                         "bbox_x1": x1,
                         "bbox_y1": y1,
                         "bbox_x2": x2,
@@ -1060,71 +1561,36 @@ def _process_video_legacy(video_path, model_name, conf_threshold, iou_threshold,
                         "crop_filename": crop_filename
                     })
 
-                    # Draw Bounding Box & Label on Output Frame
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                    label_str = f"{cls_name} {conf:.2f}"
-                    (w, h), _ = cv2.getTextSize(label_str, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-                    cv2.rectangle(frame, (x1, max(0, y1 - 20)), (x1 + w + 10, y1), color, -1)
-                    cv2.putText(frame, label_str, (x1 + 5, max(12, y1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
+                    label_str = f"{cls_cfg['name']} 0.89 (Demo)"
+                    cv2.rectangle(frame, (x1, y1 - 22), (x1 + 220, y1), color, -1)
+                    cv2.putText(frame, label_str, (x1 + 5, y1 - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
 
-        else:
-            # Demo / Simulation Mode HUD & Crops
-            if (frame_index // 15) % 3 == 1:
-                x1, y1 = int(width * 0.35), int(height * 0.65)
-                x2, y2 = int(width * 0.55), int(height * 0.85)
-                cls_cfg = DEFAULT_RDD_CLASSES[3]  # Pothole
-                color = cls_cfg["color"]
+            # Render HUD Analytics Overlay on top of frame
+            hud_text = f"RDD-YOLO | Frame: {frame_index}/{total_frames} | Defects: {current_frame_detections}"
+            cv2.rectangle(frame, (10, 10), (460, 45), (0, 0, 0), -1)
+            cv2.putText(frame, hud_text, (20, 33), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2, cv2.LINE_AA)
 
-                total_detections += 1
-                current_frame_detections += 1
-                class_counts[cls_cfg["name"]] = class_counts.get(cls_cfg["name"], 0) + 1
+            out.write(frame)
 
-                crop_filename = f"crop_frame{frame_index:04d}_det{total_detections:03d}_3_0.89.jpg"
-                crop_filepath = os.path.join(crops_dir, crop_filename)
-
-                crop_patch = clean_frame[y1:y2, x1:x2]
-                if crop_patch.size > 0:
-                    cv2.imwrite(crop_filepath, crop_patch)
-                    if len(crop_gallery_images) < 60:
-                        crop_rgb = cv2.cvtColor(crop_patch, cv2.COLOR_BGR2RGB)
-                        crop_gallery_images.append((crop_rgb, f"{cls_cfg['name']} (0.89 Demo)"))
-
-                csv_records.append({
-                    "detection_id": total_detections,
-                    "frame_index": frame_index,
-                    "timestamp_sec": timestamp_sec,
-                    "class_id": 3,
-                    "class_name": cls_cfg["name"],
-                    "confidence": 0.89,
-                    "bbox_x1": x1,
-                    "bbox_y1": y1,
-                    "bbox_x2": x2,
-                    "bbox_y2": y2,
-                    "crop_filename": crop_filename
-                })
-
-                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
-                label_str = f"{cls_cfg['name']} 0.89 (Demo)"
-                cv2.rectangle(frame, (x1, y1 - 22), (x1 + 220, y1), color, -1)
-                cv2.putText(frame, label_str, (x1 + 5, y1 - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
-
-        # Render HUD Analytics Overlay on top of frame
-        hud_text = f"RDD-YOLO | Frame: {frame_index}/{total_frames} | Defects: {current_frame_detections}"
-        cv2.rectangle(frame, (10, 10), (460, 45), (0, 0, 0), -1)
-        cv2.putText(frame, hud_text, (20, 33), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2, cv2.LINE_AA)
-
-        out.write(frame)
-
-        # Update progress bar with live ETA
-        pct = min(1.0, frame_index / total_frames)
-        time_str, finish_str = compute_live_eta(pct, start_time)
-        if time_str:
-            progress(pct, desc=f"⏳ {time_str} (Est. finish: {finish_str}) | Frame {frame_index}/{total_frames} ({total_detections} defects)")
-        else:
-            progress(pct, desc=f"RDD-YOLO Processing: Frame {frame_index}/{total_frames} ({total_detections} defects detected)")
-
-    cap.release()
-    out.release()
+            # Update progress bar with live ETA
+            pct = min(1.0, frame_index / total_frames)
+            time_str, finish_str = compute_live_eta(pct, start_time)
+            if time_str:
+                progress(pct, desc=f"⏳ {time_str} (Est. finish: {finish_str}) | Frame {frame_index}/{total_frames} ({total_detections} defects)")
+            else:
+                progress(pct, desc=f"RDD-YOLO Processing: Frame {frame_index}/{total_frames} ({total_detections} defects detected)")
+    finally:
+        if cap is not None:
+            try:
+                cap.release()
+            except Exception:
+                pass
+        if out is not None:
+            try:
+                out.release()
+            except Exception:
+                pass
 
     elapsed_time = time.time() - start_time
     proc_fps = processed_count / max(0.001, elapsed_time)
@@ -1136,6 +1602,55 @@ def _process_video_legacy(video_path, model_name, conf_threshold, iou_threshold,
             os.remove(temp_avi)
         except Exception:
             pass
+
+    # Store result for dataset builder (Raw / Non-dedup mode compatibility)
+    try:
+        raw_finalized_defects = []
+        for rec in csv_records:
+            x1, y1, x2, y2 = rec["bbox_x1"], rec["bbox_y1"], rec["bbox_x2"], rec["bbox_y2"]
+            crop_path = os.path.join(crops_dir, rec["crop_filename"])
+            
+            raw_defect = FinalizedDefect(
+                defect_type=rec["class_name"],
+                class_id=rec["class_id"],
+                avg_confidence=rec["confidence"],
+                median_confidence=rec["confidence"],
+                max_confidence=rec["confidence"],
+                max_confidence_frame=rec["frame_index"],
+                first_frame=rec["frame_index"],
+                last_frame=rec["frame_index"],
+                detection_duration_frames=1,
+                frames_observed=1,
+                avg_center=((x1 + x2) / 2.0, (y1 + y2) / 2.0),
+                avg_bbox_area=float(max(0, x2 - x1) * max(0, y2 - y1)),
+                avg_aspect_ratio=float(max(1, x2 - x1) / max(1, y2 - y1)),
+                bbox_stats={},
+                representative_crop_path=crop_path,
+                source_track_ids=[rec["detection_id"]]
+            )
+            raw_finalized_defects.append(raw_defect)
+
+        raw_pipeline_result = PipelineResult(
+            video_path=video_path,
+            total_frames=total_frames,
+            processed_frames=processed_count,
+            processing_time_sec=elapsed_time,
+            fps=proc_fps,
+            total_raw_detections=total_detections,
+            total_unique_defects=total_detections,
+            tracks_created=total_detections,
+            tracks_merged=0,
+            defect_counts=class_counts,
+            finalized_defects=raw_finalized_defects,
+            output_dir=run_output_dir,
+            annotated_video_path=final_output_video
+        )
+
+        _ANNOTATION_STATE["last_pipeline_result"] = raw_pipeline_result
+        _ANNOTATION_STATE["last_video_path"] = video_path
+        _ANNOTATION_STATE["last_inspection_mode"] = "raw"
+    except Exception as e:
+        print(f"[Warning] Could not construct raw PipelineResult for dataset builder: {e}")
 
     # Save CSV File
     with open(csv_file_path, mode='w', newline='', encoding='utf-8') as f:
@@ -1194,84 +1709,368 @@ def build_ui():
     history_runs = get_history_runs()
 
     custom_css = """
-    .main-title {
-        text-align: center;
-        margin-bottom: 0.5rem;
+    /* ─── Google Fonts ─── */
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap');
+
+    /* ─── Root Variables ─── */
+    :root {
+        --bg-primary: #0a0a0f;
+        --bg-card: rgba(15, 15, 25, 0.85);
+        --bg-glass: rgba(255, 255, 255, 0.03);
+        --border-subtle: rgba(255, 255, 255, 0.06);
+        --border-glow: rgba(249, 115, 22, 0.3);
+        --accent-orange: #f97316;
+        --accent-amber: #f59e0b;
+        --accent-red: #ef4444;
+        --accent-emerald: #10b981;
+        --accent-sky: #38bdf8;
+        --text-primary: #f1f5f9;
+        --text-secondary: #94a3b8;
+        --text-muted: #64748b;
+        --radius-lg: 16px;
+        --radius-md: 12px;
+        --radius-sm: 8px;
+        --shadow-glow: 0 0 30px rgba(249, 115, 22, 0.08);
     }
-    .main-title h1 {
-        font-size: 2.3rem;
-        font-weight: 800;
-        background: linear-gradient(90deg, #ef4444, #f97316, #eab308);
+
+    /* ─── Global Overrides ─── */
+    .gradio-container {
+        font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif !important;
+        background: var(--bg-primary) !important;
+        max-width: 1440px !important;
+    }
+
+    /* ─── Custom Scrollbar ─── */
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: rgba(249, 115, 22, 0.3); border-radius: 3px; }
+    ::-webkit-scrollbar-thumb:hover { background: rgba(249, 115, 22, 0.5); }
+
+    /* ─── Hero Header ─── */
+    .hero-container {
+        text-align: center;
+        padding: 2rem 1rem 1rem;
+        position: relative;
+    }
+    .hero-container h1 {
+        font-size: 2.6rem;
+        font-weight: 900;
+        letter-spacing: -0.03em;
+        background: linear-gradient(135deg, #f97316 0%, #f59e0b 35%, #ef4444 70%, #f97316 100%);
+        background-size: 200% 200%;
         -webkit-background-clip: text;
         -webkit-text-fill-color: transparent;
+        animation: gradient-shift 4s ease infinite;
+        margin: 0;
+        line-height: 1.2;
     }
-    .badge-bar {
+    .hero-subtitle {
+        font-size: 1rem;
+        color: var(--text-secondary);
+        margin: 0.5rem 0 0;
+        font-weight: 400;
+        letter-spacing: 0.01em;
+    }
+    @keyframes gradient-shift {
+        0%, 100% { background-position: 0% 50%; }
+        50% { background-position: 100% 50%; }
+    }
+
+    /* ─── Feature Pills ─── */
+    .pill-bar {
         display: flex;
         justify-content: center;
-        gap: 12px;
-        margin-bottom: 1.5rem;
+        flex-wrap: wrap;
+        gap: 10px;
+        margin: 1.2rem 0 0.5rem;
     }
-    .badge {
-        padding: 5px 14px;
+    .pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        padding: 6px 16px;
         border-radius: 9999px;
-        font-size: 0.85rem;
+        font-size: 0.78rem;
         font-weight: 600;
-        background: #1e293b;
-        color: #f8fafc;
-        border: 1px solid #334155;
+        background: var(--bg-glass);
+        color: var(--text-secondary);
+        border: 1px solid var(--border-subtle);
+        backdrop-filter: blur(12px);
+        transition: all 0.25s ease;
     }
-    .badge-active {
-        background: #065f46;
+    .pill:hover {
+        border-color: var(--border-glow);
+        color: var(--text-primary);
+        box-shadow: 0 0 16px rgba(249, 115, 22, 0.12);
+        transform: translateY(-1px);
+    }
+    .pill-active {
+        background: rgba(16, 185, 129, 0.1);
         color: #34d399;
-        border: 1px solid #059669;
+        border-color: rgba(16, 185, 129, 0.3);
+    }
+    .pill-active:hover {
+        border-color: rgba(16, 185, 129, 0.5);
+        box-shadow: 0 0 16px rgba(16, 185, 129, 0.15);
+    }
+
+    /* ─── Tabs Styling ─── */
+    .tab-nav button {
+        font-family: 'Inter', sans-serif !important;
+        font-weight: 600 !important;
+        font-size: 0.88rem !important;
+        letter-spacing: 0.01em;
+        border-radius: 10px 10px 0 0 !important;
+        transition: all 0.3s ease !important;
+    }
+    .tab-nav button.selected {
+        background: linear-gradient(135deg, rgba(249, 115, 22, 0.15), rgba(245, 158, 11, 0.08)) !important;
+        border-bottom: 2px solid var(--accent-orange) !important;
+        color: var(--accent-orange) !important;
+    }
+
+    /* ─── Section Headers ─── */
+    .section-header {
+        font-size: 1.05rem;
+        font-weight: 700;
+        color: var(--text-primary);
+        padding-bottom: 0.4rem;
+        margin-bottom: 0.8rem;
+        border-bottom: 2px solid;
+        border-image: linear-gradient(90deg, var(--accent-orange), transparent) 1;
+    }
+
+    /* ─── Glassmorphic Card Panels ─── */
+    .glass-panel {
+        background: var(--bg-card);
+        border: 1px solid var(--border-subtle);
+        border-radius: var(--radius-lg);
+        padding: 1rem;
+        backdrop-filter: blur(16px);
+        box-shadow: var(--shadow-glow);
+        transition: border-color 0.3s ease;
+    }
+    .glass-panel:hover {
+        border-color: rgba(255, 255, 255, 0.1);
+    }
+
+    /* ─── Run Button Glow ─── */
+    .run-btn button {
+        background: linear-gradient(135deg, #f97316, #ea580c) !important;
+        border: none !important;
+        font-weight: 700 !important;
+        font-size: 0.95rem !important;
+        letter-spacing: 0.02em;
+        box-shadow: 0 4px 20px rgba(249, 115, 22, 0.35) !important;
+        transition: all 0.3s ease !important;
+    }
+    .run-btn button:hover {
+        box-shadow: 0 6px 30px rgba(249, 115, 22, 0.5) !important;
+        transform: translateY(-1px);
+    }
+
+    /* ─── System Telemetry Bar ─── */
+    .sys-bar {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        background: rgba(15, 15, 25, 0.9);
+        border: 1px solid var(--border-subtle);
+        border-radius: var(--radius-md);
+        padding: 10px 16px;
+        backdrop-filter: blur(16px);
+    }
+    .sys-metric {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        font-size: 0.8rem;
+        font-weight: 600;
+        color: var(--text-primary);
+    }
+    .sys-metric .label { color: var(--text-secondary); font-weight: 500; }
+    .sys-metric .value { font-size: 0.95rem; font-weight: 800; font-variant-numeric: tabular-nums; }
+    .sys-metric .detail { color: var(--text-muted); font-weight: 400; font-size: 0.72rem; }
+
+    /* ─── Progress Bar ─── */
+    .progress-bar {
+        width: 60px;
+        height: 4px;
+        background: rgba(255, 255, 255, 0.08);
+        border-radius: 2px;
+        overflow: hidden;
+    }
+    .progress-fill {
+        height: 100%;
+        border-radius: 2px;
+        transition: width 0.5s ease;
+    }
+
+    /* ─── Dedup Status ─── */
+    .dedup-active {
+        display: inline-flex; align-items: center; gap: 8px;
+        padding: 8px 16px; border-radius: var(--radius-sm);
+        background: rgba(16, 185, 129, 0.08);
+        border: 1px solid rgba(16, 185, 129, 0.2);
+        color: #34d399; font-weight: 600; font-size: 0.88rem;
+    }
+    .dedup-inactive {
+        display: inline-flex; align-items: center; gap: 8px;
+        padding: 8px 16px; border-radius: var(--radius-sm);
+        background: rgba(239, 68, 68, 0.08);
+        border: 1px solid rgba(239, 68, 68, 0.2);
+        color: #f87171; font-weight: 600; font-size: 0.88rem;
+    }
+    .dedup-dot {
+        width: 8px; height: 8px; border-radius: 50%;
+        display: inline-block; animation: pulse-dot 2s ease infinite;
+    }
+    .dedup-dot-on { background: #34d399; box-shadow: 0 0 8px rgba(52, 211, 153, 0.6); }
+    .dedup-dot-off { background: #f87171; box-shadow: 0 0 8px rgba(248, 113, 113, 0.6); animation: none; }
+    @keyframes pulse-dot {
+        0%, 100% { opacity: 1; transform: scale(1); }
+        50% { opacity: 0.6; transform: scale(0.85); }
+    }
+
+    /* ─── Gallery Enhancement ─── */
+    .gallery-section {
+        margin-top: 1rem;
+        padding-top: 1rem;
+        border-top: 1px solid var(--border-subtle);
+    }
+
+    /* ─── Accordion Tweaks ─── */
+    .gradio-accordion > .label-wrap {
+        font-weight: 600 !important;
+    }
+
+    /* ─── Divider ─── */
+    .styled-divider {
+        height: 1px;
+        background: linear-gradient(90deg, transparent, var(--border-subtle), transparent);
+        margin: 1.2rem 0;
+        border: none;
+    }
+
+    /* ─── Dataset Builder Card ─── */
+    .ds-action-row button {
+        font-weight: 600 !important;
+        transition: all 0.2s ease !important;
+    }
+    .ds-action-row button:hover {
+        transform: translateY(-1px);
+    }
+
+    /* ─── Subtle Animations ─── */
+    .fade-in {
+        animation: fade-in 0.4s ease-out;
+    }
+    @keyframes fade-in {
+        from { opacity: 0; transform: translateY(8px); }
+        to { opacity: 1; transform: translateY(0); }
     }
     """
 
-    theme = gr.themes.Soft(
-        primary_hue="orange",
-        secondary_hue="slate",
-        neutral_hue="slate"
+    theme = gr.themes.Base(
+        primary_hue=gr.themes.colors.orange,
+        secondary_hue=gr.themes.colors.slate,
+        neutral_hue=gr.themes.colors.slate,
+        font=gr.themes.GoogleFont("Inter"),
+        font_mono=gr.themes.GoogleFont("JetBrains Mono"),
+    ).set(
+        body_background_fill="#0a0a0f",
+        body_background_fill_dark="#0a0a0f",
+        body_text_color="#f1f5f9",
+        body_text_color_dark="#f1f5f9",
+        body_text_color_subdued="#94a3b8",
+        body_text_color_subdued_dark="#94a3b8",
+        block_background_fill="rgba(15, 15, 25, 0.85)",
+        block_background_fill_dark="rgba(15, 15, 25, 0.85)",
+        block_border_color="rgba(255, 255, 255, 0.06)",
+        block_border_color_dark="rgba(255, 255, 255, 0.06)",
+        block_label_text_color="#94a3b8",
+        block_label_text_color_dark="#94a3b8",
+        block_title_text_color="#f1f5f9",
+        block_title_text_color_dark="#f1f5f9",
+        block_radius="12px",
+        block_shadow="0 0 30px rgba(249, 115, 22, 0.05)",
+        input_background_fill="#0f0f19",
+        input_background_fill_dark="#0f0f19",
+        input_border_color="rgba(255, 255, 255, 0.08)",
+        input_border_color_dark="rgba(255, 255, 255, 0.08)",
+        button_primary_background_fill="linear-gradient(135deg, #f97316, #ea580c)",
+        button_primary_background_fill_dark="linear-gradient(135deg, #f97316, #ea580c)",
+        button_primary_text_color="#ffffff",
+        button_primary_text_color_dark="#ffffff",
+        button_secondary_background_fill="rgba(255, 255, 255, 0.05)",
+        button_secondary_background_fill_dark="rgba(255, 255, 255, 0.05)",
+        button_secondary_text_color="#f1f5f9",
+        button_secondary_text_color_dark="#f1f5f9",
+        button_secondary_border_color="rgba(255, 255, 255, 0.1)",
+        button_secondary_border_color_dark="rgba(255, 255, 255, 0.1)",
+        checkbox_background_color="#0f0f19",
+        checkbox_background_color_dark="#0f0f19",
+        checkbox_border_color="rgba(255, 255, 255, 0.15)",
+        checkbox_border_color_dark="rgba(255, 255, 255, 0.15)",
+        checkbox_label_text_color="#f1f5f9",
+        checkbox_label_text_color_dark="#f1f5f9",
+        slider_color="#f97316",
+        slider_color_dark="#f97316",
+        table_even_background_fill="rgba(255, 255, 255, 0.02)",
+        table_even_background_fill_dark="rgba(255, 255, 255, 0.02)",
+        table_odd_background_fill="transparent",
+        table_odd_background_fill_dark="transparent",
+        border_color_accent="#f97316",
+        border_color_accent_dark="#f97316",
+        shadow_spread="0px",
     )
 
     with gr.Blocks(title="RDD-YOLO Road Damage Detection Studio") as demo:
+
+        # ─── Hero Header ───
         gr.HTML(f"""
-        <div class="main-title">
-            <h1>🚧 RDD-YOLO Road Damage Detection Studio</h1>
-            <p>Automated video inspection for potholes, longitudinal cracks, transverse cracks, and road defects.</p>
-        </div>
-        <div class="badge-bar">
-            <span class="badge badge-active">Active Model: {available_models[0]}</span>
-            <span class="badge badge-active">{'Dedup Pipeline: ON' if HAS_DEDUP_PIPELINE else 'Dedup: N/A'}</span>
-            <span class="badge">BoT-SORT Tracking</span>
-            <span class="badge">CSV Export & Defect Crops</span>
-            <span class="badge">Analysis History Explorer</span>
+        <div class="hero-container fade-in">
+            <h1>🛣️ RDD-YOLO Detection Studio</h1>
+            <p class="hero-subtitle">AI-powered road damage inspection — detect potholes, cracks & defects from video footage</p>
+            <div class="pill-bar">
+                <span class="pill pill-active">✦ Model: {available_models[0]}</span>
+                <span class="pill pill-active">{'⚡ Dedup Pipeline: Active' if HAS_DEDUP_PIPELINE else '⚡ Dedup: N/A'}</span>
+                <span class="pill">🔗 BoT-SORT Tracking</span>
+                <span class="pill">📊 CSV Export</span>
+                <span class="pill">🖼️ Defect Crops</span>
+                <span class="pill">📜 History Explorer</span>
+            </div>
         </div>
         """)
 
         with gr.Tabs():
+            # ═══════════════════════════════════════════════
             # PAGE 1: New Video Analysis
+            # ═══════════════════════════════════════════════
             with gr.TabItem("🚀 Run New Inspection"):
                 with gr.Row():
                     # Left Column: Inputs & Settings
                     with gr.Column(scale=5):
-                        gr.Markdown("### 📥 Video Input & Inspection Settings")
+                        gr.HTML('<div class="section-header">📥 Video Input & Settings</div>')
                         input_video = gr.Video(
-                            label="Input Road Footage Video",
+                            label="Upload Road Footage",
                             sources=["upload"],
                             interactive=True
                         )
                         video_est_md = gr.Markdown("")
 
-                        with gr.Accordion("⚙️ RDD-YOLO Model & Detection Parameters", open=True):
+                        with gr.Accordion("⚙️ Detection Model & Parameters", open=True):
                             with gr.Row():
                                 model_selector = gr.Dropdown(
                                     choices=available_models,
                                     value=available_models[0],
-                                    label="Select Model Weights (auto-detected from models/ directory)",
-                                    info="Automatically scans all .pt/.onnx files in models/ directory. Select any model to use.",
+                                    label="Model Weights",
+                                    info="Auto-detected from models/ directory",
                                     scale=4
                                 )
-                                btn_refresh_models = gr.Button("🔄 Refresh Models", scale=1)
+                                btn_refresh_models = gr.Button("🔄", scale=1, min_width=48)
                             
                             with gr.Row():
                                 conf_slider = gr.Slider(
@@ -1279,16 +2078,16 @@ def build_ui():
                                     maximum=0.95,
                                     value=0.25,
                                     step=0.05,
-                                    label="Confidence Threshold",
-                                    info="Minimum confidence score"
+                                    label="Confidence",
+                                    info="Min detection confidence"
                                 )
                                 iou_slider = gr.Slider(
                                     minimum=0.1,
                                     maximum=0.9,
                                     value=0.45,
                                     step=0.05,
-                                    label="IoU NMS Threshold",
-                                    info="Non-Maximum Suppression threshold"
+                                    label="IoU NMS",
+                                    info="Non-Max Suppression threshold"
                                 )
 
                             frame_skip_slider = gr.Slider(
@@ -1296,138 +2095,160 @@ def build_ui():
                                 maximum=5,
                                 value=1,
                                 step=1,
-                                label="Frame Subsampling (Speedup)",
-                                info="1 = Process all frames; 2 = Process every 2nd frame"
+                                label="Frame Skip",
+                                info="1 = all frames · 2 = every 2nd frame"
                             )
 
-                        with gr.Accordion("🔄 Duplicate Removal (BoT-SORT + Track Manager)", open=True):
+                        with gr.Accordion("🔄 Duplicate Removal Pipeline", open=True):
                             enable_dedup = gr.Checkbox(
                                 value=True,
-                                label="Enable Duplicate Removal",
-                                info="Uses BoT-SORT tracking + multi-feature verification to count each defect once",
+                                label="⚡ Activate Duplicate Removal Pipeline",
+                                info="Toggle ON to merge repeat defect detections into unique counts. Toggle OFF for raw frame-by-frame detection.",
                                 interactive=HAS_DEDUP_PIPELINE,
                             )
-                            with gr.Row():
+                            dedup_status_md = gr.HTML(
+                                '<div class="dedup-active"><span class="dedup-dot dedup-dot-on"></span> Dedup Pipeline — ACTIVE <span style="font-weight:400; color:#94a3b8; font-size:0.8rem;">· BoT-SORT + Multi-Feature Verification</span></div>'
+                            )
+                            with gr.Row(visible=True) as dedup_params_row:
                                 merge_threshold_slider = gr.Slider(
                                     minimum=0.3,
                                     maximum=0.95,
                                     value=0.65,
                                     step=0.05,
                                     label="Merge Threshold",
-                                    info="Similarity score needed to merge duplicate tracks (lower = more aggressive merging)",
+                                    info="Similarity to merge duplicates",
                                 )
                                 track_buffer_slider = gr.Slider(
                                     minimum=10,
                                     maximum=120,
                                     value=45,
                                     step=5,
-                                    label="Track Buffer (frames)",
-                                    info="How long to keep lost tracks alive (~1.5s at 30fps = 45 frames)",
+                                    label="Track Buffer",
+                                    info="Frames to keep lost tracks alive",
                                 )
 
-                        with gr.Row():
+                        with gr.Row(elem_classes="run-btn"):
                             btn_process = gr.Button("🚀 Run RDD-YOLO Detection + Dedup", variant="primary", scale=2)
-                            btn_clear = gr.ClearButton(components=[input_video], value="🧹 Clear", scale=1)
+                            btn_revoke = gr.Button("🛑 Revoke Process", variant="stop", scale=1)
+                            btn_clear = gr.ClearButton(components=[input_video], value="✕ Clear", scale=1)
 
                     # Right Column: Live Telemetry & Output Results
                     with gr.Column(scale=6):
-                        # Top-Right Section: Ultra-Compact Hardware Status Bar
-                        sys_cards_html = gr.HTML(value="<p>Initializing hardware telemetry...</p>")
+                        # System Telemetry Bar
+                        sys_cards_html = gr.HTML(value='<div class="sys-bar"><span class="sys-metric"><span class="label">Initializing telemetry...</span></span></div>')
 
-                        gr.Markdown("### 📤 Inspection Results & Downloadable Artifacts")
+                        gr.HTML('<div class="section-header">📤 Inspection Results</div>')
                         output_video = gr.Video(
-                            label="Annotated Output Video (HTML5 H.264)",
+                            label="Annotated Output Video",
                             interactive=False
                         )
                         output_csv = gr.File(
-                            label="📥 Download Detections Log (.csv)",
+                            label="📥 Detections Log (.csv)",
                             interactive=False
                         )
-                        output_summary = gr.Markdown("Ready for inspection. Upload road video footage and click **Run RDD-YOLO Detection + Dedup**. The pipeline will detect defects, track them with BoT-SORT, and remove duplicates automatically.")
+                        output_summary = gr.Markdown(
+                            "Upload road video footage and click **Run RDD-YOLO Detection + Dedup** to begin automated inspection."
+                        )
 
-                # Gallery Section for Detected Defect Crops
-                gr.Markdown("---")
-                gr.Markdown("### 🖼️ Unique Defect Crop Patches (Deduplicated)")
+                # Gallery Section
+                gr.HTML('<div class="gallery-section"></div>')
+                gr.HTML('<div class="section-header">🖼️ Detected Defect Crops</div>')
                 output_crops_gallery = gr.Gallery(
-                    label="Representative crops — one per unique physical defect (best confidence frame)",
+                    label="Representative crop patches — one per unique physical defect",
                     columns=6,
                     rows=2,
                     height="auto",
                     object_fit="contain"
                 )
 
-                # Example section if sample videos are available in inputs directory
+                # Example Videos
                 if example_videos:
-                    gr.Markdown("---")
-                    gr.Markdown("### 🎞️ Sample Road Footage (inputs/)")
+                    gr.HTML('<div class="styled-divider"></div>')
+                    gr.HTML('<div class="section-header">🎞️ Sample Road Footage</div>')
                     gr.Examples(
                         examples=[[vid] for vid in example_videos],
                         inputs=[input_video],
                         outputs=[output_video, output_csv, output_crops_gallery, output_summary],
                         fn=lambda vid: process_video(vid, available_models[0], 0.25, 0.45, 1, True, 0.65, 45),
                         cache_examples=False,
-                        label="Click a sample video to load:"
+                        label="Click a sample to load:"
                     )
 
-            # PAGE 2: RDD_Ahmedabad Dataset Builder
-            with gr.TabItem("📦 RDD_Ahmedabad Dataset Builder"):
-                gr.Markdown("### 📦 Semi-Automatic Dataset Collection & Annotation")
-                gr.Markdown("Run a video inspection first, then come here to review detected defects and add them to the **RDD_Ahmedabad** training dataset.")
+            # ═══════════════════════════════════════════════
+            # PAGE 2: Dataset Builder
+            # ═══════════════════════════════════════════════
+            with gr.TabItem("📦 Dataset Builder"):
+                gr.HTML('<div class="section-header">📦 Semi-Automatic Dataset Collection</div>')
+                
+                with gr.Row():
+                    btn_load_candidates = gr.Button("📥 Load Detections from Last Inspection", variant="primary", scale=3)
+                    ds_status_md = gr.Markdown("", scale=7)
 
                 with gr.Row():
-                    btn_load_candidates = gr.Button(
-                        "📥 Load Detections from Last Inspection",
-                        variant="primary", scale=3
-                    )
-                    ds_status_md = gr.Markdown("")
+                    # Left: Full frame adjustment
+                    with gr.Column(scale=6):
+                        ds_full_frame = gr.HTML(
+                            value='<div style="text-align:center;color:#94a3b8;padding:40px;font-family:Inter,sans-serif;">Click 📥 Load Detections to begin.</div>'
+                        )
+                        with gr.Row():
+                            ds_padding_slider = gr.Slider(
+                                minimum=0, maximum=200, value=0, step=5,
+                                label="Expand Margin Padding (px)", scale=3
+                            )
+                            btn_reset_box = gr.Button("🔄 Reset Box", variant="secondary", scale=1)
 
-                with gr.Row():
-                    # Left: Crop preview
+                    # Right: Info, Crop Preview & Actions
                     with gr.Column(scale=4):
                         ds_crop_image = gr.Image(
-                            label="Detection Crop Preview",
-                            type="numpy",
-                            interactive=False,
-                            height=320,
+                            label="Crop Preview (Will be saved)",
+                            type="numpy", interactive=False, height=280,
                         )
-
-                    # Right: Info + Actions
-                    with gr.Column(scale=6):
-                        ds_info_md = gr.Markdown("Click **Load Detections** after running an inspection.")
+                        
                         ds_progress_md = gr.Markdown("")
+                        ds_info_md = gr.Markdown("Click **Load Detections** after running an inspection.")
 
                         rdd_class_names = RDD_CLASS_CONFIG.get_class_names() if RDD_CLASS_CONFIG else ["POTHOLE"]
                         ds_class_dropdown = gr.Dropdown(
                             choices=rdd_class_names,
-                            value=rdd_class_names[0],
-                            label="Assign Class (change if prediction is wrong)",
+                            value=rdd_class_names[0] if rdd_class_names else None,
+                            label="Assign Class",
+                            info="Change if the model prediction is incorrect",
                             interactive=True,
                         )
 
-                        with gr.Row():
+                        with gr.Row(elem_classes="ds-action-row"):
                             btn_accept = gr.Button("✅ Accept & Save", variant="primary", scale=2)
                             btn_skip = gr.Button("⏭️ Skip", variant="secondary", scale=1)
+                        
+                        # Hidden coordinates for JS sync (dynamically applies bounding box changes)
+                        with gr.Row(visible=False):
+                            ds_x1 = gr.Number(label="X1", value=0, elem_id="ds_bbox_x1")
+                            ds_y1 = gr.Number(label="Y1", value=0, elem_id="ds_bbox_y1")
+                            ds_x2 = gr.Number(label="X2", value=0, elem_id="ds_bbox_x2")
+                            ds_y2 = gr.Number(label="Y2", value=0, elem_id="ds_bbox_y2")
 
-                gr.Markdown("---")
-                gr.Markdown("### 📊 Current Dataset Statistics")
+                gr.HTML('<div class="styled-divider"></div>')
+                gr.HTML('<div class="section-header">📊 Dataset Statistics</div>')
                 ds_stats_md = gr.Markdown(
                     value=get_dataset_stats_md()
                 )
                 btn_refresh_stats = gr.Button("🔄 Refresh Stats")
 
-            # PAGE 3: History & Past Reports Explorer
-            with gr.TabItem("📜 Analysis History & Reports"):
-                gr.Markdown("### 📜 Previous Inspection Runs & Output Explorer")
+            # ═══════════════════════════════════════════════
+            # PAGE 3: History & Reports
+            # ═══════════════════════════════════════════════
+            with gr.TabItem("📜 History & Reports"):
+                gr.HTML('<div class="section-header">📜 Previous Inspections</div>')
                 
                 with gr.Row():
                     history_selector = gr.Dropdown(
                         choices=history_runs,
                         value=history_runs[0] if history_runs else None,
-                        label="Select Past Analysis Run (outputs/ directory)",
-                        info="Select any previous run folder to load its video, CSV log, summary metrics, and defect crops.",
+                        label="Select Past Run",
+                        info="Browse previous analysis folders from outputs/",
                         scale=4
                     )
-                    btn_refresh_history = gr.Button("🔄 Refresh List", scale=1)
+                    btn_refresh_history = gr.Button("🔄", scale=1, min_width=48)
 
                 with gr.Row():
                     with gr.Column(scale=5):
@@ -1436,21 +2257,24 @@ def build_ui():
                             interactive=False
                         )
                         hist_csv = gr.File(
-                            label="📥 Download Detections Log (.csv)",
+                            label="📥 Detections Log (.csv)",
                             interactive=False
                         )
                     with gr.Column(scale=6):
-                        hist_summary = gr.Markdown("Select an analysis run from the dropdown above to view past inspection report.")
+                        hist_summary = gr.Markdown("Select a run from the dropdown to view its inspection report.")
 
-                gr.Markdown("---")
-                gr.Markdown("### 🖼️ Defect Crop Patches from Selected Run")
+                gr.HTML('<div class="gallery-section"></div>')
+                gr.HTML('<div class="section-header">🖼️ Defect Crops from Selected Run</div>')
                 hist_crops_gallery = gr.Gallery(
-                    label="Cropped Image Patches from Past Run",
+                    label="Saved crop patches from past run",
                     columns=6,
                     rows=2,
                     height="auto",
                     object_fit="contain"
                 )
+
+        # ─── Timers & Event Handlers ───
+        # (All event handler logic preserved identically)
 
         # Initial load and periodic timer for hardware status bar (every 2s)
         sys_timer = gr.Timer(2)
@@ -1466,11 +2290,18 @@ def build_ui():
         )
 
         # Event Handlers
-        btn_process.click(
+        btn_process_event = btn_process.click(
             fn=process_video,
             inputs=[input_video, model_selector, conf_slider, iou_slider, frame_skip_slider,
                     enable_dedup, merge_threshold_slider, track_buffer_slider],
             outputs=[output_video, output_csv, output_crops_gallery, output_summary]
+        )
+
+        btn_revoke.click(
+            fn=revoke_processing,
+            inputs=[],
+            outputs=[output_summary],
+            cancels=[btn_process_event]
         )
 
         # Model Refresh Event Handler
@@ -1481,6 +2312,13 @@ def build_ui():
             ),
             inputs=[],
             outputs=[model_selector]
+        )
+
+        # Dedup Toggle Event Handler
+        enable_dedup.change(
+            fn=on_toggle_dedup,
+            inputs=[enable_dedup],
+            outputs=[dedup_status_md, btn_process, dedup_params_row]
         )
 
         # Video Estimation Event Handlers
@@ -1517,40 +2355,106 @@ def build_ui():
             msg, count = prepare_annotation_candidates()
             if count > 0:
                 crop_img, info, suggested, progress, is_done = get_current_candidate_display()
-                return msg, crop_img, info, progress, gr.Dropdown(value=suggested)
-            return msg, None, "No candidates available.", "", gr.Dropdown()
+                # Also load the full frame overlay for adjustment panel
+                frame_overlay, x1, y1, x2, y2 = get_full_frame_with_overlay()
+                return (
+                    msg, crop_img, info, progress, gr.Dropdown(value=suggested),
+                    frame_overlay, x1, y1, x2, y2, 0
+                )
+            return (
+                msg, None, "No candidates available.", "", gr.Dropdown(),
+                None, 0, 0, 0, 0, 0
+            )
 
         btn_load_candidates.click(
             fn=_on_load_candidates,
             inputs=[],
-            outputs=[ds_status_md, ds_crop_image, ds_info_md, ds_progress_md, ds_class_dropdown]
+            outputs=[
+                ds_status_md, ds_crop_image, ds_info_md, ds_progress_md, ds_class_dropdown,
+                ds_full_frame, ds_x1, ds_y1, ds_x2, ds_y2, ds_padding_slider
+            ]
         )
 
         def _on_accept(chosen_class):
             crop_img, info, suggested, progress, is_done = accept_annotation(chosen_class)
             stats = get_dataset_stats_md()
-            return crop_img, info, progress, gr.Dropdown(value=suggested), stats
+            # Load frame overlay for the next candidate
+            frame_overlay, x1, y1, x2, y2 = get_full_frame_with_overlay()
+            return (
+                crop_img, info, progress, gr.Dropdown(value=suggested), stats,
+                frame_overlay, x1, y1, x2, y2, 0
+            )
 
         btn_accept.click(
             fn=_on_accept,
             inputs=[ds_class_dropdown],
-            outputs=[ds_crop_image, ds_info_md, ds_progress_md, ds_class_dropdown, ds_stats_md]
+            outputs=[
+                ds_crop_image, ds_info_md, ds_progress_md, ds_class_dropdown, ds_stats_md,
+                ds_full_frame, ds_x1, ds_y1, ds_x2, ds_y2, ds_padding_slider
+            ]
         )
 
         def _on_skip():
             crop_img, info, suggested, progress, is_done = skip_annotation()
-            return crop_img, info, progress, gr.Dropdown(value=suggested)
+            # Load frame overlay for the next candidate
+            frame_overlay, x1, y1, x2, y2 = get_full_frame_with_overlay()
+            return (
+                crop_img, info, progress, gr.Dropdown(value=suggested),
+                frame_overlay, x1, y1, x2, y2, 0
+            )
 
         btn_skip.click(
             fn=_on_skip,
             inputs=[],
-            outputs=[ds_crop_image, ds_info_md, ds_progress_md, ds_class_dropdown]
+            outputs=[
+                ds_crop_image, ds_info_md, ds_progress_md, ds_class_dropdown,
+                ds_full_frame, ds_x1, ds_y1, ds_x2, ds_y2, ds_padding_slider
+            ]
         )
 
         btn_refresh_stats.click(
             fn=get_dataset_stats_md,
             inputs=[],
             outputs=[ds_stats_md]
+        )
+
+        # ── Crop Adjustment Event Handlers ──
+
+        def _on_padding_change(padding_px):
+            """Live update crop and frame overlay when padding slider changes."""
+            crop_rgb, frame_annotated, x1, y1, x2, y2 = adjust_bbox_with_padding(padding_px)
+            return crop_rgb, frame_annotated, x1, y1, x2, y2
+
+        ds_padding_slider.change(
+            fn=_on_padding_change,
+            inputs=[ds_padding_slider],
+            outputs=[ds_crop_image, ds_full_frame, ds_x1, ds_y1, ds_x2, ds_y2]
+        )
+
+        def _on_coords_change(x1, y1, x2, y2):
+            """Apply manually entered bbox coordinates (or dynamically dragged coordinates from canvas)."""
+            crop_rgb, frame_annotated = apply_bbox_coord_adjustment(x1, y1, x2, y2)
+            return crop_rgb, frame_annotated
+
+        gr.on(
+            triggers=[ds_x1.change, ds_y1.change, ds_x2.change, ds_y2.change],
+            fn=_on_coords_change,
+            inputs=[ds_x1, ds_y1, ds_x2, ds_y2],
+            outputs=[ds_crop_image, ds_full_frame]
+        )
+
+        def _on_reset_box():
+            """Reset bbox to original detection coordinates."""
+            crop_rgb, frame_annotated, x1, y1, x2, y2, pad = reset_bbox_to_original()
+            return crop_rgb, frame_annotated, x1, y1, x2, y2, pad
+
+        btn_reset_box.click(
+            fn=_on_reset_box,
+            inputs=[],
+            outputs=[
+                ds_crop_image, ds_full_frame,
+                ds_x1, ds_y1, ds_x2, ds_y2, ds_padding_slider
+            ]
         )
 
     return demo, theme, custom_css
