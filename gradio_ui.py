@@ -61,6 +61,13 @@ except ImportError as e:
     print(f"[Warning] rdd_dedup pipeline not available: {e}")
     HAS_DEDUP_PIPELINE = False
 
+# Import the visualizer utility
+try:
+    from rdd_dedup.utils.visualizer import PipelineVisualizer, generate_visualizations_from_directory
+    HAS_VISUALIZER = True
+except ImportError:
+    HAS_VISUALIZER = False
+
 # Import the dataset collection system
 try:
     from rdd_dedup.dataset import (
@@ -398,11 +405,11 @@ def get_history_runs():
 def load_history_details(selected_run_folder):
     """Loads past analysis details (video, csv, crops gallery, summary markdown) for selected run."""
     if not selected_run_folder:
-        return None, None, [], "Please select an analysis run from the dropdown."
+        return None, None, [], "Please select an analysis run from the dropdown.", []
 
     run_dir = os.path.join(OUTPUTS_DIR, selected_run_folder)
     if not os.path.exists(run_dir):
-        return None, None, [], f"❌ Error: Run directory '{selected_run_folder}' not found."
+        return None, None, [], f"❌ Error: Run directory '{selected_run_folder}' not found.", []
 
     # Locate output mp4 video
     mp4_files = [f for f in os.listdir(run_dir) if f.startswith("output_video_") and f.endswith(".mp4")]
@@ -459,7 +466,18 @@ def load_history_details(selected_run_folder):
     else:
         summary_md = f"### 📜 Inspection Run: `{selected_run_folder}`\n\n*Loaded from `{run_dir}`*"
 
-    return video_path, csv_path, crop_gallery, summary_md
+    # Load or generate visualization charts for history
+    charts_gallery = []
+    if HAS_VISUALIZER:
+        try:
+            chart_data = generate_visualizations_from_directory(run_dir)
+            for chart_path, caption in chart_data:
+                if os.path.exists(chart_path):
+                    charts_gallery.append((chart_path, caption))
+        except Exception as e:
+            print(f"[Warning] Failed to load history visualization charts: {e}")
+
+    return video_path, csv_path, crop_gallery, summary_md, charts_gallery
 
 
 def load_yolo_model(model_name):
@@ -635,7 +653,7 @@ def process_video(video_path, model_name, conf_threshold, iou_threshold, frame_s
       - SQLite defect database (defects.db)
     """
     if not video_path or not os.path.exists(video_path):
-        return None, None, [], "❌ Error: Invalid or missing video input file."
+        return None, None, [], "❌ Error: Invalid or missing video input file.", []
 
     # Reset revocation flag for new processing session
     _CANCEL_FLAG["requested"] = False
@@ -710,13 +728,13 @@ def _process_video_with_dedup(video_path, model_name, conf_threshold, iou_thresh
             cancel_check=lambda: _CANCEL_FLAG["requested"],
         )
     except InterruptedError as e:
-        return None, None, [], f"⚠️ **Process Revoked**: {e}"
+        return None, None, [], f"⚠️ **Process Revoked**: {e}", []
     except Exception as e:
         if _CANCEL_FLAG["requested"]:
-            return None, None, [], "⚠️ **Process Revoked**: Video processing was cancelled by user revocation request."
+            return None, None, [], "⚠️ **Process Revoked**: Video processing was cancelled by user revocation request.", []
         import traceback
         traceback.print_exc()
-        return None, None, [], f"❌ Pipeline error: {e}"
+        return None, None, [], f"❌ Pipeline error: {e}", []
 
     # Store result for dataset builder
     _ANNOTATION_STATE["last_pipeline_result"] = result
@@ -813,7 +831,18 @@ def _process_video_with_dedup(video_path, model_name, conf_threshold, iou_thresh
 🗄️ *Defect database: `defects.db`*
 """
 
-    return final_video, csv_path, crop_gallery_images, summary_md
+    # 5. Visualization charts
+    charts_gallery = []
+    if HAS_VISUALIZER and result.output_dir:
+        try:
+            chart_data = generate_visualizations_from_directory(result.output_dir)
+            for chart_path, caption in chart_data:
+                if os.path.exists(chart_path):
+                    charts_gallery.append((chart_path, caption))
+        except Exception as e:
+            print(f"[Warning] Failed to generate visualization charts: {e}")
+
+    return final_video, csv_path, crop_gallery_images, summary_md, charts_gallery
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1392,20 +1421,33 @@ def _process_video_legacy(video_path, model_name, conf_threshold, iou_threshold,
     Used as fallback when dedup is disabled or in Demo mode.
     """
     if not video_path or not os.path.exists(video_path):
-        return None, None, [], "❌ Error: Invalid or missing video input file."
+        return None, None, [], "❌ Error: Invalid or missing video input file.", []
 
     start_time = time.time()
-    timestamp_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    import re as _re
 
-    # Create timestamped run folder inside outputs/
-    run_output_dir = os.path.join(OUTPUTS_DIR, f"analysis_{timestamp_str}")
+    # Build videoname_modelname folder name
+    _video_name = os.path.splitext(os.path.basename(video_path))[0]
+    _video_name = _re.sub(r'[^\w\-]', '_', _video_name).strip('_')
+    _clean_model = model_name.split(' ')[0].strip()
+    _model_name = os.path.splitext(os.path.basename(_clean_model))[0]
+    _model_name = _re.sub(r'[^\w\-]', '_', _model_name).strip('_')
+    _base_folder = f"{_video_name}_{_model_name}"
+    run_output_dir = os.path.join(OUTPUTS_DIR, _base_folder)
+    if os.path.exists(run_output_dir):
+        _counter = 2
+        while os.path.exists(os.path.join(OUTPUTS_DIR, f"{_base_folder}_{_counter}")):
+            _counter += 1
+        run_output_dir = os.path.join(OUTPUTS_DIR, f"{_base_folder}_{_counter}")
+
     crops_dir = os.path.join(run_output_dir, "crops")
     os.makedirs(crops_dir, exist_ok=True)
+    timestamp_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
     # Open input video
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
-        return None, None, [], "❌ Error: Could not open video file."
+        return None, None, [], "❌ Error: Could not open video file.", []
 
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -1449,7 +1491,7 @@ def _process_video_legacy(video_path, model_name, conf_threshold, iou_threshold,
         while cap.isOpened():
             if _CANCEL_FLAG["requested"]:
                 print("[RDD UI] Video processing revoked by user.")
-                return None, None, [], "⚠️ **Process Revoked**: Video processing was cancelled by user revocation request."
+                return None, None, [], "⚠️ **Process Revoked**: Video processing was cancelled by user revocation request.", []
 
             ret, frame = cap.read()
             if not ret:
@@ -1699,7 +1741,18 @@ def _process_video_legacy(video_path, model_name, conf_threshold, iou_threshold,
 
     summary_md += f"\n📁 *All files saved to: `{run_output_dir}`*"
 
-    return final_output_video, csv_file_path, crop_gallery_images, summary_md
+    # Generate visualization charts
+    charts_gallery = []
+    if HAS_VISUALIZER:
+        try:
+            chart_data = generate_visualizations_from_directory(run_output_dir)
+            for chart_path, caption in chart_data:
+                if os.path.exists(chart_path):
+                    charts_gallery.append((chart_path, caption))
+        except Exception as e:
+            print(f"[Warning] Failed to generate legacy visualization charts: {e}")
+
+    return final_output_video, csv_file_path, crop_gallery_images, summary_md, charts_gallery
 
 
 # Construct Gradio Modern Dashboard UI with Multi-Tab Pages
@@ -2161,6 +2214,17 @@ def build_ui():
                     object_fit="contain"
                 )
 
+                # Data Visualization Charts Section
+                gr.HTML('<div class="styled-divider"></div>')
+                gr.HTML('<div class="section-header">📈 Data Visualization</div>')
+                output_charts_gallery = gr.Gallery(
+                    label="Pipeline analytics — defect distribution, confidence, timeline, and spatial analysis",
+                    columns=3,
+                    rows=2,
+                    height="auto",
+                    object_fit="contain"
+                )
+
                 # Example Videos
                 if example_videos:
                     gr.HTML('<div class="styled-divider"></div>')
@@ -2168,7 +2232,7 @@ def build_ui():
                     gr.Examples(
                         examples=[[vid] for vid in example_videos],
                         inputs=[input_video],
-                        outputs=[output_video, output_csv, output_crops_gallery, output_summary],
+                        outputs=[output_video, output_csv, output_crops_gallery, output_summary, output_charts_gallery],
                         fn=lambda vid: process_video(vid, available_models[0], 0.25, 0.45, 1, True, 0.65, 45),
                         cache_examples=False,
                         label="Click a sample to load:"
@@ -2273,6 +2337,17 @@ def build_ui():
                     object_fit="contain"
                 )
 
+                # History Data Visualization Charts
+                gr.HTML('<div class="styled-divider"></div>')
+                gr.HTML('<div class="section-header">📈 Data Visualization</div>')
+                hist_charts_gallery = gr.Gallery(
+                    label="Pipeline analytics from selected run",
+                    columns=3,
+                    rows=2,
+                    height="auto",
+                    object_fit="contain"
+                )
+
         # ─── Timers & Event Handlers ───
         # (All event handler logic preserved identically)
 
@@ -2294,7 +2369,7 @@ def build_ui():
             fn=process_video,
             inputs=[input_video, model_selector, conf_slider, iou_slider, frame_skip_slider,
                     enable_dedup, merge_threshold_slider, track_buffer_slider],
-            outputs=[output_video, output_csv, output_crops_gallery, output_summary]
+            outputs=[output_video, output_csv, output_crops_gallery, output_summary, output_charts_gallery]
         )
 
         btn_revoke.click(
@@ -2337,7 +2412,7 @@ def build_ui():
         history_selector.change(
             fn=load_history_details,
             inputs=[history_selector],
-            outputs=[hist_video, hist_csv, hist_crops_gallery, hist_summary]
+            outputs=[hist_video, hist_csv, hist_crops_gallery, hist_summary, hist_charts_gallery]
         )
 
         btn_refresh_history.click(
