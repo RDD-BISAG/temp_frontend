@@ -10,6 +10,8 @@ import logging
 import collections
 import asyncio
 import cv2
+import requests
+import zipfile
 import numpy as np
 import pandas as pd
 import gradio as gr
@@ -477,7 +479,7 @@ def load_history_details(selected_run_folder):
         except Exception as e:
             print(f"[Warning] Failed to load history visualization charts: {e}")
 
-    return video_path, csv_path, crop_gallery, summary_md, charts_gallery
+    return video_path, csv_path, crop_gallery, summary_md, charts_gallery, []
 
 
 def load_yolo_model(model_name):
@@ -653,7 +655,7 @@ def process_video(video_path, model_name, conf_threshold, iou_threshold, frame_s
       - SQLite defect database (defects.db)
     """
     if not video_path or not os.path.exists(video_path):
-        return None, None, [], "❌ Error: Invalid or missing video input file.", []
+        return None, None, [], "❌ Error: Invalid or missing video input file.", [], []
 
     # Reset revocation flag for new processing session
     _CANCEL_FLAG["requested"] = False
@@ -728,13 +730,13 @@ def _process_video_with_dedup(video_path, model_name, conf_threshold, iou_thresh
             cancel_check=lambda: _CANCEL_FLAG["requested"],
         )
     except InterruptedError as e:
-        return None, None, [], f"⚠️ **Process Revoked**: {e}", []
+        return None, None, [], f"⚠️ **Process Revoked**: {e}", [], []
     except Exception as e:
         if _CANCEL_FLAG["requested"]:
-            return None, None, [], "⚠️ **Process Revoked**: Video processing was cancelled by user revocation request.", []
+            return None, None, [], "⚠️ **Process Revoked**: Video processing was cancelled by user revocation request.", [], []
         import traceback
         traceback.print_exc()
-        return None, None, [], f"❌ Pipeline error: {e}", []
+        return None, None, [], f"❌ Pipeline error: {e}", [], []
 
     # Store result for dataset builder
     _ANNOTATION_STATE["last_pipeline_result"] = result
@@ -786,6 +788,18 @@ def _process_video_with_dedup(video_path, model_name, conf_threshold, iou_thresh
                     crop_gallery_images.append((crop_rgb, label))
             except Exception:
                 continue
+
+    # 3.5 Segmentation overlay gallery
+    segmentation_gallery_images = []
+    if hasattr(result, 'finalized_defects'):
+        for d in result.finalized_defects:
+            if d.measurement_data and d.measurement_data.get("overlay_path"):
+                overlay_path = d.measurement_data.get("overlay_path")
+                if os.path.exists(overlay_path):
+                    area = d.measurement_data.get("pixel_area", 0)
+                    quality = d.measurement_data.get("mask_quality_score", 0.0)
+                    caption = f"{d.defect_type} - {area}px (quality {quality:.2f})"
+                    segmentation_gallery_images.append((overlay_path, caption))
 
     # 4. Summary markdown with dedup statistics
     reduction_pct = 0.0
@@ -842,7 +856,7 @@ def _process_video_with_dedup(video_path, model_name, conf_threshold, iou_thresh
         except Exception as e:
             print(f"[Warning] Failed to generate visualization charts: {e}")
 
-    return final_video, csv_path, crop_gallery_images, summary_md, charts_gallery
+    return final_video, csv_path, crop_gallery_images, summary_md, charts_gallery, segmentation_gallery_images
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1008,6 +1022,67 @@ def accept_annotation(chosen_class):
     _ANNOTATION_STATE["accepted_count"] = _ANNOTATION_STATE.get("accepted_count", 0) + 1
     _ANNOTATION_STATE["current_index"] = idx + 1
 
+    return get_current_candidate_display()
+
+
+def add_another_defect_annotation(chosen_class):
+    """
+    Accept the current candidate's bounding box and class, save it,
+    but DO NOT advance to the next candidate frame. This allows adding
+    multiple defects in the same frame manually.
+    """
+    candidates = _ANNOTATION_STATE.get("candidates", [])
+    idx = _ANNOTATION_STATE.get("current_index", 0)
+
+    if not candidates or idx >= len(candidates):
+        return get_current_candidate_display()
+
+    c = candidates[idx]
+
+    if not RDD_CLASS_CONFIG or not RDD_DATASET_MANAGER or not RDD_ANNOTATION_MANAGER:
+        return get_current_candidate_display()
+
+    # Resolve class
+    class_name = chosen_class.strip().upper() if chosen_class else c.class_name
+    class_id = RDD_CLASS_CONFIG.get_class_id(class_name)
+    if class_id < 0:
+        class_id = 0
+        class_name = RDD_CLASS_CONFIG.get_class_name(0)
+
+    # Save to dataset (use 1.0 confidence since it is manual)
+    saved = RDD_DATASET_MANAGER.add_annotation(
+        frame=c.original_frame,
+        bbox=c.bbox,
+        class_id=class_id,
+        class_name=class_name,
+        source_video=c.source_video,
+        frame_number=c.frame_number,
+        track_id=c.track_id,
+        confidence=1.0,
+        crop_image=c.crop_image,
+    )
+
+    # Record metadata
+    x1, y1, x2, y2 = c.bbox
+    RDD_ANNOTATION_MANAGER.add_record(
+        image_name=saved.get("image_filename", ""),
+        crop_name=saved.get("crop_filename", ""),
+        class_id=class_id,
+        class_name=class_name,
+        confidence=1.0,
+        source_video=c.source_video,
+        frame_number=c.frame_number,
+        track_id=c.track_id,
+        bbox_x=x1,
+        bbox_y=y1,
+        bbox_width=x2 - x1,
+        bbox_height=y2 - y1,
+        split=saved.get("split", "train"),
+    )
+
+    _ANNOTATION_STATE["accepted_count"] = _ANNOTATION_STATE.get("accepted_count", 0) + 1
+
+    # Return same candidate display without advancing
     return get_current_candidate_display()
 
 
@@ -1414,6 +1489,214 @@ def reset_bbox_to_original():
     return crop_rgb, html, ix1, iy1, ix2, iy2, 0
 
 
+# ═══════════════════════════════════════════════════════════════════════
+# CLOUD GPU PROCESSING LOGIC
+# ═══════════════════════════════════════════════════════════════════════
+
+def test_cloud_connection(url):
+    """Test the connection to the Cloud GPU Server."""
+    if not url:
+        return "<div class='sys-bar'><span class='sys-metric'><span class='label' style='color:#f87171;'>✗ Please enter a valid URL</span></span></div>"
+    
+    url = url.rstrip("/")
+    try:
+        r = requests.get(f"{url}/health", timeout=5)
+        if r.status_code == 200:
+            return "<div class='sys-bar'><span class='sys-metric'><span class='label' style='color:#34d399;'>✓ Connected to Cloud GPU</span></span></div>"
+        else:
+            return f"<div class='sys-bar'><span class='sys-metric'><span class='label' style='color:#f87171;'>✗ Unreachable ({r.status_code})</span></span></div>"
+    except Exception as e:
+        return f"<div class='sys-bar'><span class='sys-metric'><span class='label' style='color:#f87171;'>✗ Unreachable: {e}</span></span></div>"
+
+def process_video_cloud(video_path, model_name, url, progress=gr.Progress()):
+    """Sends video and model to Cloud GPU for processing."""
+    if not video_path or not os.path.exists(video_path):
+        raise gr.Error("Invalid or missing video input file.")
+    if not url:
+        raise gr.Error("Please enter a valid Notebook Server URL.")
+        
+    url = url.rstrip("/")
+    model_path = os.path.join(MODELS_DIR, model_name)
+    if not os.path.exists(model_path):
+        raise gr.Error(f"Model file {model_name} not found locally.")
+
+    progress(0, desc="Initiating Cloud GPU connection...")
+    
+    # We do a streaming POST request so it doesn't time out, but we don't have true progress.
+    # The progress UI in Gradio will just spin in indeterminate mode during the request.
+    try:
+        with open(video_path, "rb") as vf, open(model_path, "rb") as mf:
+            files = {
+                "video": (os.path.basename(video_path), vf, "video/mp4"),
+                "model": (os.path.basename(model_path), mf, "application/octet-stream")
+            }
+            progress(0.05, desc="Uploading video and model to Cloud GPU (this may take a minute)...")
+            
+            # 1. Start the job
+            r = requests.post(f"{url}/process", files=files)
+            
+            if r.status_code != 200:
+                try:
+                    err_msg = r.json().get("detail", r.text)
+                except Exception:
+                    err_msg = r.text
+                
+                if "<!DOCTYPE html>" in err_msg or "<html" in err_msg:
+                    raise gr.Error(f"Cloud Server Error {r.status_code}: The remote Colab server is unreachable or crashed (Bad Gateway).")
+                else:
+                    raise gr.Error(f"Cloud Server Error: {err_msg}")
+                    
+            job_data = r.json()
+            job_id = job_data.get("job_id")
+            if not job_id:
+                raise gr.Error("Cloud Server Error: Missing job_id in response.")
+
+            # 2. Poll for completion
+            progress(0.1, desc="Job started. Polling status...")
+            while True:
+                time.sleep(3)
+                sr = requests.get(f"{url}/status/{job_id}")
+                if sr.status_code != 200:
+                    raise gr.Error(f"Cloud Server Error {sr.status_code} while polling status.")
+                
+                status_data = sr.json()
+                status = status_data.get("status", "processing")
+                
+                if status in ("completed", "done"):
+                    break
+                elif status == "failed":
+                    err_msg = status_data.get("error", "Unknown error during cloud processing.")
+                    raise gr.Error(f"Cloud Processing Failed: {err_msg}")
+                else:
+                    msg = status_data.get("message", f"Status: {status}...")
+                    prog_val = status_data.get("progress", 0.5)
+                    try:
+                        prog_val = float(prog_val)
+                    except (ValueError, TypeError):
+                        prog_val = 0.5
+                    progress(prog_val, desc=f"Cloud GPU: {msg}")
+
+            progress(0.9, desc="Processing complete! Downloading results archive...")
+            
+            # 3. Download the result
+            dr = requests.get(f"{url}/download/{job_id}", stream=True)
+            if dr.status_code != 200:
+                raise gr.Error(f"Failed to download archive. Server returned {dr.status_code}")
+                
+            import re as _re
+            _video_name = os.path.splitext(os.path.basename(video_path))[0]
+            _video_name = _re.sub(r'[^\w\-]', '_', _video_name).strip('_')
+            _clean_model = model_name.split(' ')[0].strip()
+            _model_name = os.path.splitext(os.path.basename(_clean_model))[0]
+            _model_name = _re.sub(r'[^\w\-]', '_', _model_name).strip('_')
+
+            cd = dr.headers.get("content-disposition", "")
+            if "filename=" in cd:
+                fname = cd.split("filename=")[1].strip('"\'')
+                if fname.startswith(job_id) or fname == f"{job_id}.zip":
+                    fname = f"{_video_name}_{_model_name}_{job_id[:8]}.zip"
+            else:
+                fname = f"{_video_name}_{_model_name}_{job_id[:8]}.zip"
+                
+            out_dir = os.path.join(OUTPUTS_DIR, "cloud_runs")
+            os.makedirs(out_dir, exist_ok=True)
+            out_path = os.path.join(out_dir, fname)
+            
+            base, ext = os.path.splitext(out_path)
+            counter = 1
+            while os.path.exists(out_path):
+                out_path = f"{base}_{counter}{ext}"
+                counter += 1
+                
+            with open(out_path, "wb") as f:
+                for chunk in dr.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+                        
+            # Unzip and load results into UI
+            progress(0.95, desc="Extracting results for display...")
+            run_folder_name = None
+            try:
+                with zipfile.ZipFile(out_path, 'r') as zip_ref:
+                    # Find the root folder name inside the zip
+                    top_level_dirs = set(os.path.normpath(name).split(os.sep)[0] for name in zip_ref.namelist())
+                    if len(top_level_dirs) == 1:
+                        run_folder_name = list(top_level_dirs)[0]
+                        extract_path = OUTPUTS_DIR
+                    else:
+                        run_folder_name = os.path.splitext(os.path.basename(out_path))[0]
+                        extract_path = os.path.join(OUTPUTS_DIR, run_folder_name)
+                        
+                    zip_ref.extractall(extract_path)
+            except Exception as e:
+                print(f"[Cloud GPU] Warning: failed to extract zip: {e}")
+                return out_path, None, None, [], f"⚠️ Could not extract zip to display results: {e}", []
+                
+            # Load details using existing function
+            v, csv, crops, summary, charts = load_history_details(run_folder_name)
+            
+            # Reconstruct PipelineResult for Dataset Builder
+            try:
+                import json
+                from rdd_dedup.tracking.defect_track import PipelineResult
+                summary_json_path = os.path.join(OUTPUTS_DIR, run_folder_name, "summary.json")
+                if os.path.exists(summary_json_path):
+                    with open(summary_json_path, "r", encoding="utf-8") as f:
+                        result_dict = json.load(f)
+                    _ANNOTATION_STATE["last_pipeline_result"] = PipelineResult.from_dict(result_dict)
+                    _ANNOTATION_STATE["last_video_path"] = video_path
+                    _ANNOTATION_STATE["last_inspection_mode"] = "dedup"
+            except Exception as e:
+                print(f"[Cloud GPU] Warning: failed to parse PipelineResult for dataset builder: {e}")
+            
+            # Delete the zip file to avoid duplication
+            try:
+                if os.path.exists(out_path):
+                    os.remove(out_path)
+            except Exception as e:
+                print(f"[Cloud GPU] Warning: failed to delete zip file: {e}")
+                
+            return None, v, csv, crops, summary, charts
+    except requests.exceptions.RequestException as e:
+        raise gr.Error(f"Network error connecting to Cloud GPU: {str(e)}")
+
+def fetch_cloud_runs(url):
+    """Fetch run history from Cloud GPU."""
+    if not url:
+        return []
+    url = url.rstrip("/")
+    try:
+        r = requests.get(f"{url}/runs", timeout=5)
+        if r.status_code == 200:
+            return r.json().get("runs", [])
+    except Exception:
+        pass
+    return []
+
+def download_cloud_run(run_name, url):
+    """Download a specific run archive from the cloud."""
+    if not url or not run_name:
+        raise gr.Error("Missing URL or run name.")
+    url = url.rstrip("/")
+    try:
+        r = requests.get(f"{url}/runs/{run_name}/download", stream=True)
+        if r.status_code != 200:
+            raise gr.Error(f"Failed to download. Server returned {r.status_code}")
+            
+        out_dir = os.path.join(OUTPUTS_DIR, "cloud_runs")
+        os.makedirs(out_dir, exist_ok=True)
+        out_path = os.path.join(out_dir, f"{run_name}.zip")
+        
+        with open(out_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=8192):
+                if chunk:
+                    f.write(chunk)
+        return out_path
+    except requests.exceptions.RequestException as e:
+        raise gr.Error(f"Network error: {str(e)}")
+
+
+
 def _process_video_legacy(video_path, model_name, conf_threshold, iou_threshold,
                           frame_skip, progress):
     """
@@ -1752,7 +2035,7 @@ def _process_video_legacy(video_path, model_name, conf_threshold, iou_threshold,
         except Exception as e:
             print(f"[Warning] Failed to generate legacy visualization charts: {e}")
 
-    return final_output_video, csv_file_path, crop_gallery_images, summary_md, charts_gallery
+    return final_output_video, csv_file_path, crop_gallery_images, summary_md, charts_gallery, []
 
 
 # Construct Gradio Modern Dashboard UI with Multi-Tab Pages
@@ -2107,6 +2390,25 @@ def build_ui():
                     # Left Column: Inputs & Settings
                     with gr.Column(scale=5):
                         gr.HTML('<div class="section-header">📥 Video Input & Settings</div>')
+                        
+                        mode_toggle = gr.Radio(
+                            choices=["💻 Local (CPU)", "☁️ Cloud GPU (Remote Server)"],
+                            value="💻 Local (CPU)",
+                            label="Processing Mode",
+                            info="Run locally or offload to a remote Cloud GPU"
+                        )
+                        
+                        cloud_url_state = gr.BrowserState("", storage_key="rdd_cloud_server_url")
+                        
+                        with gr.Column(visible=False) as cloud_settings_col:
+                            cloud_url_input = gr.Textbox(
+                                label="Notebook Server URL", 
+                                placeholder="https://xxxx.trycloudflare.com",
+                                info="Paste the tunnel URL from your Colab notebook."
+                            )
+                            btn_test_cloud = gr.Button("Test Connection", size="sm")
+                            cloud_status_md = gr.HTML("")
+                            
                         input_video = gr.Video(
                             label="Upload Road Footage",
                             sources=["upload"],
@@ -2182,6 +2484,7 @@ def build_ui():
 
                         with gr.Row(elem_classes="run-btn"):
                             btn_process = gr.Button("🚀 Run RDD-YOLO Detection + Dedup", variant="primary", scale=2)
+                            btn_process_cloud = gr.Button("🚀 Run on Cloud GPU", variant="primary", scale=2, visible=False)
                             btn_revoke = gr.Button("🛑 Revoke Process", variant="stop", scale=1)
                             btn_clear = gr.ClearButton(components=[input_video], value="✕ Clear", scale=1)
 
@@ -2191,39 +2494,54 @@ def build_ui():
                         sys_cards_html = gr.HTML(value='<div class="sys-bar"><span class="sys-metric"><span class="label">Initializing telemetry...</span></span></div>')
 
                         gr.HTML('<div class="section-header">📤 Inspection Results</div>')
-                        output_video = gr.Video(
-                            label="Annotated Output Video",
-                            interactive=False
-                        )
-                        output_csv = gr.File(
-                            label="📥 Detections Log (.csv)",
-                            interactive=False
-                        )
-                        output_summary = gr.Markdown(
-                            "Upload road video footage and click **Run RDD-YOLO Detection + Dedup** to begin automated inspection."
-                        )
+                        with gr.Column(visible=False) as cloud_output_col:
+                            cloud_output_file = gr.File(label="📦 Cloud Output Archive (.zip)")
+                            cloud_output_msg = gr.Markdown("Cloud GPU results will appear here as a downloadable ZIP archive.")
 
-                # Gallery Section
-                gr.HTML('<div class="gallery-section"></div>')
-                gr.HTML('<div class="section-header">🖼️ Detected Defect Crops</div>')
-                output_crops_gallery = gr.Gallery(
-                    label="Representative crop patches — one per unique physical defect",
-                    columns=6,
-                    rows=2,
-                    height="auto",
-                    object_fit="contain"
-                )
+                        with gr.Column(visible=True) as local_output_col:
+                            output_video = gr.Video(
+                                label="Annotated Output Video",
+                                interactive=False
+                            )
+                            output_csv = gr.File(
+                                label="📥 Detections Log (.csv)",
+                                interactive=False
+                            )
+                            output_summary = gr.Markdown(
+                                "Upload road video footage and click **Run RDD-YOLO Detection + Dedup** to begin automated inspection."
+                            )
 
-                # Data Visualization Charts Section
-                gr.HTML('<div class="styled-divider"></div>')
-                gr.HTML('<div class="section-header">📈 Data Visualization</div>')
-                output_charts_gallery = gr.Gallery(
-                    label="Pipeline analytics — defect distribution, confidence, timeline, and spatial analysis",
-                    columns=3,
-                    rows=2,
-                    height="auto",
-                    object_fit="contain"
-                )
+                with gr.Column(visible=True) as local_galleries_col:
+                    # Gallery Section
+                    gr.HTML('<div class="gallery-section"></div>')
+                    gr.HTML('<div class="section-header">🖼️ Detected Defect Crops</div>')
+                    output_crops_gallery = gr.Gallery(
+                        label="Representative crop patches — one per unique physical defect",
+                        columns=6,
+                        rows=2,
+                        height="auto",
+                        object_fit="contain"
+                    )
+
+                    gr.HTML('<div class="section-header">✨ SAM2 Segmentation Results</div>')
+                    output_seg_gallery = gr.Gallery(
+                        label="Segmentation Overlays",
+                        columns=4,
+                        rows=2,
+                        height="auto",
+                        object_fit="contain"
+                    )
+
+                    # Data Visualization Charts Section
+                    gr.HTML('<div class="styled-divider"></div>')
+                    gr.HTML('<div class="section-header">📈 Data Visualization</div>')
+                    output_charts_gallery = gr.Gallery(
+                        label="Pipeline analytics — defect distribution, confidence, timeline, and spatial analysis",
+                        columns=3,
+                        rows=2,
+                        height="auto",
+                        object_fit="contain"
+                    )
 
                 # Example Videos
                 if example_videos:
@@ -2232,7 +2550,7 @@ def build_ui():
                     gr.Examples(
                         examples=[[vid] for vid in example_videos],
                         inputs=[input_video],
-                        outputs=[output_video, output_csv, output_crops_gallery, output_summary, output_charts_gallery],
+                        outputs=[output_video, output_csv, output_crops_gallery, output_summary, output_charts_gallery, output_seg_gallery],
                         fn=lambda vid: process_video(vid, available_models[0], 0.25, 0.45, 1, True, 0.65, 45),
                         cache_examples=False,
                         label="Click a sample to load:"
@@ -2282,6 +2600,7 @@ def build_ui():
 
                         with gr.Row(elem_classes="ds-action-row"):
                             btn_accept = gr.Button("✅ Accept & Save", variant="primary", scale=2)
+                            btn_add_another = gr.Button("➕ Add Another in Frame", variant="secondary", scale=2)
                             btn_skip = gr.Button("⏭️ Skip", variant="secondary", scale=1)
                         
                         # Hidden coordinates for JS sync (dynamically applies bounding box changes)
@@ -2348,6 +2667,19 @@ def build_ui():
                     object_fit="contain"
                 )
 
+                with gr.Accordion("☁️ Cloud Run History", open=False):
+                    with gr.Row():
+                        cloud_history_selector = gr.Dropdown(
+                            choices=[],
+                            label="Select Cloud Run to Download",
+                            info="Requires valid Notebook Server URL in the New Inspection tab.",
+                            scale=4
+                        )
+                        btn_refresh_cloud_history = gr.Button("🔄 Refresh", scale=1, min_width=48)
+                    
+                    btn_download_cloud_run = gr.Button("⬇️ Download Selected Run", variant="primary")
+                    cloud_run_download = gr.File(label="📦 Downloaded Archive", visible=False)
+
         # ─── Timers & Event Handlers ───
         # (All event handler logic preserved identically)
 
@@ -2365,11 +2697,67 @@ def build_ui():
         )
 
         # Event Handlers
+        # Cloud URL State mapping
+        demo.load(lambda x: x, inputs=cloud_url_state, outputs=cloud_url_input)
+        cloud_url_input.change(lambda x: x, inputs=cloud_url_input, outputs=cloud_url_state)
+
+        # Mode Toggle logic
+        def toggle_mode(mode):
+            is_cloud = mode == "☁️ Cloud GPU (Remote Server)"
+            return (
+                gr.update(visible=is_cloud),
+                gr.update(visible=is_cloud),
+                gr.update(visible=not is_cloud),
+                gr.update(visible=is_cloud),
+                gr.update(visible=not is_cloud),
+                gr.update(visible=not is_cloud)
+            )
+
+        mode_toggle.change(
+            fn=toggle_mode,
+            inputs=[mode_toggle],
+            outputs=[cloud_settings_col, btn_process_cloud, btn_process, cloud_output_col, local_output_col, local_galleries_col]
+        )
+
+        btn_test_cloud.click(
+            fn=test_cloud_connection,
+            inputs=[cloud_url_input],
+            outputs=[cloud_status_md]
+        )
+
+        btn_process_cloud_event = btn_process_cloud.click(
+            fn=process_video_cloud,
+            inputs=[input_video, model_selector, cloud_url_input],
+            outputs=[
+                cloud_output_file,
+                output_video, output_csv, output_crops_gallery, output_summary, output_charts_gallery, output_seg_gallery
+            ]
+        ).then(
+            fn=lambda: (gr.update(visible=True), gr.update(visible=True)),
+            inputs=[],
+            outputs=[local_output_col, local_galleries_col]
+        )
+
+        btn_refresh_cloud_history.click(
+            fn=lambda url: gr.Dropdown(choices=fetch_cloud_runs(url)),
+            inputs=[cloud_url_input],
+            outputs=[cloud_history_selector]
+        )
+        
+        btn_download_cloud_run.click(
+            fn=download_cloud_run,
+            inputs=[cloud_history_selector, cloud_url_input],
+            outputs=[cloud_run_download]
+        ).then(
+            fn=lambda: gr.update(visible=True),
+            outputs=[cloud_run_download]
+        )
+
         btn_process_event = btn_process.click(
             fn=process_video,
             inputs=[input_video, model_selector, conf_slider, iou_slider, frame_skip_slider,
                     enable_dedup, merge_threshold_slider, track_buffer_slider],
-            outputs=[output_video, output_csv, output_crops_gallery, output_summary, output_charts_gallery]
+            outputs=[output_video, output_csv, output_crops_gallery, output_summary, output_charts_gallery, output_seg_gallery]
         )
 
         btn_revoke.click(
@@ -2469,6 +2857,25 @@ def build_ui():
             ]
         )
 
+        def _on_add_another(chosen_class):
+            crop_img, info, suggested, progress, is_done = add_another_defect_annotation(chosen_class)
+            stats = get_dataset_stats_md()
+            # We don't advance, so reload the same frame overlay
+            frame_overlay, x1, y1, x2, y2 = get_full_frame_with_overlay()
+            return (
+                crop_img, info, progress, gr.Dropdown(value=suggested), stats,
+                frame_overlay, x1, y1, x2, y2, 0
+            )
+
+        btn_add_another.click(
+            fn=_on_add_another,
+            inputs=[ds_class_dropdown],
+            outputs=[
+                ds_crop_image, ds_info_md, ds_progress_md, ds_class_dropdown, ds_stats_md,
+                ds_full_frame, ds_x1, ds_y1, ds_x2, ds_y2, ds_padding_slider
+            ]
+        )
+
         def _on_skip():
             crop_img, info, suggested, progress, is_done = skip_annotation()
             # Load frame overlay for the next candidate
@@ -2546,4 +2953,5 @@ if __name__ == "__main__":
         css=css,
         allowed_paths=[OUTPUTS_DIR, BASE_DIR]
     )
+
 

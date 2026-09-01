@@ -1,0 +1,4 @@
+    .hero-container {
+    .hero-container h1 {
+        <div class="hero-container fade-in">
+            <h1>🛣️ RDD-YOLO Detection Studio</h1>

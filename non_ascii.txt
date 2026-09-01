@@ -1,0 +1,151 @@
+1: ﻿import os
+127: # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+128: # RDD_Ahmedabad Dataset Collection â€” Global State
+129: # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+167: return "âš ï¸ **Process Revocation Requested**: Terminating active backend video processing task..."
+171: # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+173: # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+341: <span class="label">âš¡ CPU</span>
+347: <span class="label">ðŸ§  RAM</span>
+353: <span class="label">ðŸŽ® GPU</span>
+357: <span class="detail">â±ï¸ {uptime_min}m {uptime_sec}s</span>
+414: return None, None, [], f"âŒ Error: Run directory '{selected_run_folder}' not found.", []
+445: ### ðŸ“œ Previous Inspection Report (`{selected_run_folder}`)
+455: #### ðŸ› ï¸ Defect Category Breakdown:
+467: summary_md = f"### ðŸ“œ Inspection Run: `{selected_run_folder}`\n\n*Loaded from `{run_dir}`*"
+469: summary_md = f"### ðŸ“œ Inspection Run: `{selected_run_folder}`\n\n*Loaded from `{run_dir}`*"
+562: f"â±ï¸ **Estimated Completion Time:** `{time_display}` *(Finish around {finish_str})* | "
+628: status_html = '<div class="dedup-active"><span class="dedup-dot dedup-dot-on"></span> Dedup Pipeline â€” ACTIVE <span style="font-weight:400; color:#94a3b8; font-size:0.8rem;">Â· BoT-SORT + Multi-Feature Verification</span></div>'
+629: btn_label = "ðŸš€ Run RDD-YOLO Detection + Dedup"
+632: status_html = '<div class="dedup-inactive"><span class="dedup-dot dedup-dot-off"></span> Dedup Pipeline â€” OFF <span style="font-weight:400; color:#94a3b8; font-size:0.8rem;">Â· Raw Frame-by-Frame Detection</span></div>'
+633: btn_label = "ðŸš€ Run RDD-YOLO Detection (Raw Mode)"
+645: YOLO + BoT-SORT tracking â†’ TrackManager â†’ DuplicateVerifier â†’ DefectDatabase
+658: return None, None, [], "âŒ Error: Invalid or missing video input file.", [], []
+663: # â”€â”€ Dedup Pipeline Path â”€â”€
+670: # â”€â”€ Fallback: Original frame-by-frame detection (no tracking/dedup) â”€â”€
+719: progress(fraction, desc=f"â³ {time_str} (Est. finish: {finish_str}) | {message}")
+733: return None, None, [], f"âš ï¸ **Process Revoked**: {e}", [], []
+736: return None, None, [], "âš ï¸ **Process Revoked**: Video processing was cancelled by user revocation request.", [], []
+739: return None, None, [], f"âŒ Pipeline error: {e}", [], []
+746: # â”€â”€ Convert outputs to Gradio format â”€â”€
+748: # 1. Annotated video â€” re-encode to H.264 for browser compatibility
+766: # 3. Crop gallery â€” load saved crops from the dedup pipeline
+810: ### ðŸ“Š RDD-YOLO Inspection Summary â€” With Duplicate Removal
+819: #### ðŸ” Detection & Deduplication Results
+826: | **Unique Physical Defects** | **ðŸŽ¯ {result.total_unique_defects}** |
+827: | **Duplicate Reduction** | **ðŸ“‰ {reduction_pct:.1f}%** |
+829: #### ðŸ› ï¸ Unique Defect Breakdown:
+836: #### âš™ï¸ Pipeline Configuration
+843: ðŸ“ *All files saved to: `{result.output_dir}`*
+844: ðŸ“Š *Merge audit log: `merge_audit_log.json`*
+845: ðŸ—„ï¸ *Defect database: `defects.db`*
+862: # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+863: # RDD_Ahmedabad Dataset Builder â€” Backend Functions
+864: # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+876: return "âŒ No inspection result available. Run a video inspection first on the 'ðŸš€ Run New Inspection' tab.", 0
+879: return "âŒ Dataset system not available. Check configs/rdd_ahmedabad_classes.yaml.", 0
+884: return "âš ï¸ No annotation candidates found. The inspection did not detect any defects.", 0
+893: return f"âœ… {len(candidates)} defect crops ready for review ({mode_label}).", len(candidates)
+911: ### âœ… Dataset Collection Complete!
+923: return None, done_md, "", f"Done â€” {accepted + skipped}/{len(candidates)} reviewed", True
+1103: # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+1104: # Crop Box Adjustment â€” Backend Helpers
+1105: # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+1195: return '<div style="text-align:center;color:#94a3b8;padding:40px;font-family:Inter,sans-serif;">No frame loaded. Click âœï¸ Adjust Crop to load the source frame.</div>'
+1215: <div class="hint">ðŸŸ  Drag corners to resize &nbsp;Â·&nbsp; Drag inside box to move &nbsp;Â·&nbsp; Click ðŸ“ Apply to update crop</div>
+1369: # Escape for safe embedding in srcdoc attribute (double-quotes â†’ &quot;)
+1492: # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+1494: # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+1499: return "<div class='sys-bar'><span class='sys-metric'><span class='label' style='color:#f87171;'>âœ— Please enter a valid URL</span></span></div>"
+1505: return "<div class='sys-bar'><span class='sys-metric'><span class='label' style='color:#34d399;'>âœ“ Connected to Cloud GPU</span></span></div>"
+1507: return f"<div class='sys-bar'><span class='sys-metric'><span class='label' style='color:#f87171;'>âœ— Unreachable ({r.status_code})</span></span></div>"
+1509: return f"<div class='sys-bar'><span class='sys-metric'><span class='label' style='color:#f87171;'>âœ— Unreachable: {e}</span></span></div>"
+1633: return out_path, None, None, [], f"âš ï¸ Could not extract zip to display results: {e}", []
+1707: return None, None, [], "âŒ Error: Invalid or missing video input file.", []
+1733: return None, None, [], "âŒ Error: Could not open video file.", []
+1777: return None, None, [], "âš ï¸ **Process Revoked**: Video processing was cancelled by user revocation request.", []
+1905: progress(pct, desc=f"â³ {time_str} (Est. finish: {finish_str}) | Frame {frame_index}/{total_frames} ({total_detections} defects)")
+2007: ### ðŸ“Š RDD-YOLO Inspection Summary (Legacy Mode â€” No Dedup)
+2018: > âš ï¸ *Duplicate removal is disabled. Enable it in the Dedup Settings to get unique defect counts.*
+2020: #### ðŸ› ï¸ Defect Category Breakdown:
+2025: summary_md += f"\nðŸ“ *All files saved to: `{run_output_dir}`*"
+2048: /* â”€â”€â”€ Google Fonts â”€â”€â”€ */
+2051: /* â”€â”€â”€ Root Variables â”€â”€â”€ */
+2072: /* â”€â”€â”€ Global Overrides â”€â”€â”€ */
+2079: /* â”€â”€â”€ Custom Scrollbar â”€â”€â”€ */
+2085: /* â”€â”€â”€ Hero Header â”€â”€â”€ */
+2115: /* â”€â”€â”€ Feature Pills â”€â”€â”€ */
+2153: /* â”€â”€â”€ Tabs Styling â”€â”€â”€ */
+2168: /* â”€â”€â”€ Section Headers â”€â”€â”€ */
+2179: /* â”€â”€â”€ Glassmorphic Card Panels â”€â”€â”€ */
+2193: /* â”€â”€â”€ Run Button Glow â”€â”€â”€ */
+2208: /* â”€â”€â”€ System Telemetry Bar â”€â”€â”€ */
+2233: /* â”€â”€â”€ Progress Bar â”€â”€â”€ */
+2247: /* â”€â”€â”€ Dedup Status â”€â”€â”€ */
+2273: /* â”€â”€â”€ Gallery Enhancement â”€â”€â”€ */
+2280: /* â”€â”€â”€ Accordion Tweaks â”€â”€â”€ */
+2285: /* â”€â”€â”€ Divider â”€â”€â”€ */
+2293: /* â”€â”€â”€ Dataset Builder Card â”€â”€â”€ */
+2302: /* â”€â”€â”€ Subtle Animations â”€â”€â”€ */
+2368: # â”€â”€â”€ Hero Header â”€â”€â”€
+2371: <h1>ðŸ›£ï¸ RDD-YOLO Detection Studio</h1>
+2372: <p class="hero-subtitle">AI-powered road damage inspection â€” detect potholes, cracks & defects from video footage</p>
+2374: <span class="pill pill-active">âœ¦ Model: {available_models[0]}</span>
+2375: <span class="pill pill-active">{'âš¡ Dedup Pipeline: Active' if HAS_DEDUP_PIPELINE else 'âš¡ Dedup: N/A'}</span>
+2376: <span class="pill">ðŸ”— BoT-SORT Tracking</span>
+2377: <span class="pill">ðŸ“Š CSV Export</span>
+2378: <span class="pill">ðŸ–¼ï¸ Defect Crops</span>
+2379: <span class="pill">ðŸ“œ History Explorer</span>
+2385: # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+2387: # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+2388: with gr.TabItem("ðŸš€ Run New Inspection"):
+2392: gr.HTML('<div class="section-header">ðŸ“¥ Video Input & Settings</div>')
+2395: choices=["ðŸ’» Local (CPU)", "â˜ï¸ Cloud GPU (Remote Server)"],
+2396: value="ðŸ’» Local (CPU)",
+2419: with gr.Accordion("âš™ï¸ Detection Model & Parameters", open=True):
+2428: btn_refresh_models = gr.Button("ðŸ”„", scale=1, min_width=48)
+2454: info="1 = all frames Â· 2 = every 2nd frame"
+2457: with gr.Accordion("ðŸ”„ Duplicate Removal Pipeline", open=True):
+2460: label="âš¡ Activate Duplicate Removal Pipeline",
+2465: '<div class="dedup-active"><span class="dedup-dot dedup-dot-on"></span> Dedup Pipeline â€” ACTIVE <span style="font-weight:400; color:#94a3b8; font-size:0.8rem;">Â· BoT-SORT + Multi-Feature Verification</span></div>'
+2486: btn_process = gr.Button("ðŸš€ Run RDD-YOLO Detection + Dedup", variant="primary", scale=2)
+2487: btn_process_cloud = gr.Button("ðŸš€ Run on Cloud GPU", variant="primary", scale=2, visible=False)
+2488: btn_revoke = gr.Button("ðŸ›‘ Revoke Process", variant="stop", scale=1)
+2489: btn_clear = gr.ClearButton(components=[input_video], value="âœ• Clear", scale=1)
+2496: gr.HTML('<div class="section-header">ðŸ“¤ Inspection Results</div>')
+2498: cloud_output_file = gr.File(label="ðŸ“¦ Cloud Output Archive (.zip)")
+2507: label="ðŸ“¥ Detections Log (.csv)",
+2517: gr.HTML('<div class="section-header">ðŸ–¼ï¸ Detected Defect Crops</div>')
+2519: label="Representative crop patches â€” one per unique physical defect",
+2526: gr.HTML('<div class="section-header">✨ SAM2 Segmentation Results</div>')
+2537: gr.HTML('<div class="section-header">ðŸ“ˆ Data Visualization</div>')
+2539: label="Pipeline analytics â€” defect distribution, confidence, timeline, and spatial analysis",
+2549: gr.HTML('<div class="section-header">ðŸŽžï¸ Sample Road Footage</div>')
+2559: # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+2561: # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+2562: with gr.TabItem("ðŸ“¦ Dataset Builder"):
+2563: gr.HTML('<div class="section-header">ðŸ“¦ Semi-Automatic Dataset Collection</div>')
+2566: btn_load_candidates = gr.Button("ðŸ“¥ Load Detections from Last Inspection", variant="primary", scale=3)
+2573: value='<div style="text-align:center;color:#94a3b8;padding:40px;font-family:Inter,sans-serif;">Click ðŸ“¥ Load Detections to begin.</div>'
+2580: btn_reset_box = gr.Button("ðŸ”„ Reset Box", variant="secondary", scale=1)
+2602: btn_accept = gr.Button("âœ… Accept & Save", variant="primary", scale=2)
+2603: btn_add_another = gr.Button("âž• Add Another in Frame", variant="secondary", scale=2)
+2604: btn_skip = gr.Button("â­ï¸ Skip", variant="secondary", scale=1)
+2614: gr.HTML('<div class="section-header">ðŸ“Š Dataset Statistics</div>')
+2618: btn_refresh_stats = gr.Button("ðŸ”„ Refresh Stats")
+2620: # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+2622: # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+2623: with gr.TabItem("ðŸ“œ History & Reports"):
+2624: gr.HTML('<div class="section-header">ðŸ“œ Previous Inspections</div>')
+2634: btn_refresh_history = gr.Button("ðŸ”„", scale=1, min_width=48)
+2643: label="ðŸ“¥ Detections Log (.csv)",
+2650: gr.HTML('<div class="section-header">ðŸ–¼ï¸ Defect Crops from Selected Run</div>')
+2661: gr.HTML('<div class="section-header">ðŸ“ˆ Data Visualization</div>')
+2670: with gr.Accordion("â˜ï¸ Cloud Run History", open=False):
+2678: btn_refresh_cloud_history = gr.Button("ðŸ”„ Refresh", scale=1, min_width=48)
+2680: btn_download_cloud_run = gr.Button("â¬‡ï¸ Download Selected Run", variant="primary")
+2681: cloud_run_download = gr.File(label="ðŸ“¦ Downloaded Archive", visible=False)
+2683: # â”€â”€â”€ Timers & Event Handlers â”€â”€â”€
+2706: is_cloud = mode == "â˜ï¸ Cloud GPU (Remote Server)"
+2815: # â”€â”€ Dataset Builder Event Handlers â”€â”€
+2903: # â”€â”€ Crop Adjustment Event Handlers â”€â”€
