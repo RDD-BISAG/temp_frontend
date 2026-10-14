@@ -15,24 +15,90 @@ import zipfile
 import numpy as np
 import pandas as pd
 import gradio as gr
+from typing import Dict, Any, List, Optional, Union, Tuple
 
 # Silence WinError 10054 ConnectionResetError noise on Windows asyncio event loops
 if sys.platform == "win32":
     try:
-        def _silence_win_connection_reset(loop, context):
-            exception = context.get("exception")
-            if isinstance(exception, ConnectionResetError):
-                return
-            loop.default_exception_handler(context)
-
-        try:
-            loop = asyncio.get_event_loop_policy().get_event_loop()
-            if loop and not loop.is_closed():
-                loop.set_exception_handler(_silence_win_connection_reset)
-        except Exception:
-            pass
+        import asyncio.proactor_events as _asyncio_pe
+        _orig_call_conn_lost = _asyncio_pe._ProactorBasePipeTransport._call_connection_lost
+        def _safe_call_connection_lost(self, exc):
+            try:
+                _orig_call_conn_lost(self, exc)
+            except ConnectionResetError:
+                pass
+            except OSError as e:
+                if getattr(e, "winerror", None) == 10054:
+                    pass
+                else:
+                    raise
+        _asyncio_pe._ProactorBasePipeTransport._call_connection_lost = _safe_call_connection_lost
     except Exception:
         pass
+
+# ── Windows Gradio Upload File-Locking Self-Healing Patch ──
+# Prevents PermissionError: [Errno 13] when uploading or re-uploading videos on Windows
+try:
+    import gradio.route_utils as _gr_route_utils
+    import gradio.routes as _gr_routes
+    import shutil as _shutil
+
+    def _safe_move_uploaded_files_to_cache(files, destinations):
+        for file, dest in zip(files, destinations, strict=False):
+            try:
+                if not os.path.exists(file):
+                    continue
+                if os.path.exists(dest) and os.path.getsize(dest) > 0:
+                    try:
+                        os.unlink(file)
+                    except OSError:
+                        pass
+                    continue
+                try:
+                    os.replace(file, dest)
+                    continue
+                except OSError:
+                    pass
+                _shutil.move(file, dest)
+            except PermissionError:
+                if os.path.exists(dest):
+                    try:
+                        if os.path.exists(file):
+                            os.unlink(file)
+                    except OSError:
+                        pass
+                else:
+                    raise
+            except Exception:
+                pass
+
+    _orig_upload_fn = _gr_route_utils.upload_fn
+
+    async def _safe_upload_fn(request, upload_dir, max_file_size, upload_id, force_move=True, upload_progress=None):
+        out_files, to_copy, locs = await _orig_upload_fn(
+            request, upload_dir, max_file_size, upload_id, force_move=force_move, upload_progress=upload_progress
+        )
+        filtered_to_copy = []
+        filtered_locs = []
+        for src_f, dst_f in zip(to_copy, locs):
+            if os.path.exists(dst_f) and os.path.getsize(dst_f) > 0:
+                try:
+                    if os.path.exists(src_f):
+                        os.unlink(src_f)
+                except OSError:
+                    pass
+            else:
+                filtered_to_copy.append(src_f)
+                filtered_locs.append(dst_f)
+        return out_files, filtered_to_copy, filtered_locs
+
+    _gr_route_utils.move_uploaded_files_to_cache = _safe_move_uploaded_files_to_cache
+    _gr_routes.move_uploaded_files_to_cache = _safe_move_uploaded_files_to_cache
+    _gr_route_utils.upload_fn = _safe_upload_fn
+    _gr_routes.upload_fn = _safe_upload_fn
+except Exception as _patch_err:
+    print(f"[Warning] Could not initialize Windows Gradio upload patch: {_patch_err}")
+
 
 # Try importing psutil for CPU & RAM system hardware monitoring
 try:
@@ -79,6 +145,14 @@ try:
 except ImportError as e:
     print(f"[Warning] rdd_dedup dataset system not available: {e}")
     HAS_DATASET_SYSTEM = False
+
+# Import the GIS enrichment backend
+try:
+    from backend.geo_service import enrich_inspection_with_gis
+    HAS_GIS_BACKEND = True
+except ImportError as e:
+    print(f"[Warning] GIS backend not available: {e}")
+    HAS_GIS_BACKEND = False
 
 # Try importing ultralytics for YOLO support, with fallback handling
 try:
@@ -150,11 +224,23 @@ if HAS_DATASET_SYSTEM and os.path.exists(CLASS_CONFIG_PATH):
 _ANNOTATION_STATE = {
     "candidates": [],           # List[CandidateAnnotation]
     "current_index": 0,
+    "staged_defects": [],       # List[dict]: staged annotations before permanent commit
+    "next_staged_id": 1,        # Monotonic ID counter for staged defects
+    "editing_staged_id": None,  # ID of staged defect currently being edited
     "accepted_count": 0,
     "skipped_count": 0,
     "changed_count": 0,
     "last_pipeline_result": None,
     "last_video_path": None,
+    "last_inspection_mode": "dedup",
+}
+
+# Global state for GIS enrichment session
+_GIS_STATE = {
+    "last_video_path": None,
+    "last_output_dir": None,
+    "last_summary_path": None,
+    "last_pipeline_result": None,
 }
 
 # Global flag to signal cancellation / revocation of ongoing video processing
@@ -362,25 +448,37 @@ def update_system_dashboard():
     return cards_html, df_melted, df_raw
 
 
-def get_available_models():
-    """Scans the models directory for available PyTorch (.pt) weights and prioritizes RDD-YOLO models."""
-    model_files = []
+def get_available_models(use_openvino=False):
+    """Scans the models directory for available models.
+    If use_openvino is True, scans for OpenVINO model directories (containing .xml).
+    If use_openvino is False, scans for PyTorch (.pt) weights."""
+    model_entries = []
     
     if os.path.exists(MODELS_DIR):
-        for root, _, files in os.walk(MODELS_DIR):
-            for file in files:
-                if file.endswith(".pt") or file.endswith(".onnx"):
-                    rel_path = os.path.relpath(os.path.join(root, file), MODELS_DIR)
-                    rel_path = rel_path.replace("\\", "/")
-                    model_files.append(rel_path)
-                    
-    if not model_files:
-        model_files = ["rdd_yolo.pt (Default)", "yolov8n.pt (Baseline)", "Demo / Simulation Mode"]
-    else:
-        model_files.append("yolov8n.pt (Baseline)")
-        model_files.append("Demo / Simulation Mode")
+        if use_openvino:
+            for root, dirs, files in os.walk(MODELS_DIR):
+                if any(f.endswith(".xml") for f in files) or os.path.basename(root).endswith("_openvino_model"):
+                    rel_path = os.path.relpath(root, MODELS_DIR).replace("\\", "/")
+                    if rel_path != "." and rel_path not in model_entries:
+                        model_entries.append(rel_path)
+                    dirs.clear()
+            if not model_entries:
+                model_entries = ["No OpenVINO models found"]
+        else:
+            for root, _, files in os.walk(MODELS_DIR):
+                for file in files:
+                    if file.endswith(".pt"):
+                        rel_path = os.path.relpath(os.path.join(root, file), MODELS_DIR)
+                        rel_path = rel_path.replace("\\", "/")
+                        model_entries.append(rel_path)
+                        
+            if not model_entries:
+                model_entries = ["rdd_yolo.pt (Default)", "yolov8n.pt (Baseline)", "Demo / Simulation Mode"]
+            else:
+                model_entries.append("yolov8n.pt (Baseline)")
+                model_entries.append("Demo / Simulation Mode")
 
-    return model_files
+    return model_entries
 
 
 def get_example_videos():
@@ -391,6 +489,236 @@ def get_example_videos():
             if file.lower().endswith(('.mp4', '.avi', '.mov', '.mkv')):
                 examples.append(os.path.join(INPUTS_DIR, file))
     return examples
+
+
+def get_example_gpx_files():
+    """Finds available sample GPX files in inputs/ and subdirectories."""
+    gpx_files = []
+    if os.path.exists(INPUTS_DIR):
+        for root, _, files in os.walk(INPUTS_DIR):
+            for file in sorted(files):
+                if file.lower().endswith(".gpx"):
+                    gpx_files.append(os.path.join(root, file))
+    return gpx_files
+
+
+MAX_CLASS_SLIDERS = 16
+_MODEL_CLASSES_CACHE: Dict[str, Dict[int, str]] = {}
+
+
+def get_model_class_dict(model_name: str) -> Dict[int, str]:
+    """
+    Extracts class names for any model (.pt, OpenVINO folder, or Demo).
+    Uses caching and lightweight metadata inspection for instant UI updates.
+    """
+    if not model_name:
+        return {cid: info["name"] for cid, info in DEFAULT_RDD_CLASSES.items()}
+
+    clean_name = model_name.split(" ")[0].strip()
+    if clean_name in _MODEL_CLASSES_CACHE:
+        return _MODEL_CLASSES_CACHE[clean_name]
+
+    if "Demo" in model_name:
+        return {cid: info["name"] for cid, info in DEFAULT_RDD_CLASSES.items()}
+
+    # 1. Check OpenVINO folder
+    full_path = os.path.join(MODELS_DIR, clean_name)
+    if os.path.isdir(full_path):
+        meta_yaml = os.path.join(full_path, "metadata.yaml")
+        if os.path.exists(meta_yaml):
+            try:
+                import yaml
+                with open(meta_yaml, "r", encoding="utf-8") as f:
+                    ydata = yaml.safe_load(f)
+                    if isinstance(ydata, dict) and "names" in ydata and isinstance(ydata["names"], dict):
+                        res = {int(k): str(v).title() for k, v in ydata["names"].items()}
+                        _MODEL_CLASSES_CACHE[clean_name] = res
+                        return res
+            except Exception as e:
+                print(f"[Warning] Failed to read OpenVINO metadata.yaml: {e}")
+
+    # 2. Check PyTorch .pt weights file (fast checkpoint inspect without loading full model)
+    pt_path = full_path if os.path.isfile(full_path) else os.path.join(MODELS_DIR, clean_name)
+    if not os.path.isfile(pt_path) and os.path.isfile(clean_name):
+        pt_path = clean_name
+
+    if os.path.isfile(pt_path) and pt_path.endswith(".pt"):
+        try:
+            import torch
+            ckpt = torch.load(pt_path, map_location="cpu", weights_only=False)
+            m = ckpt.get("model")
+            names = getattr(m, "names", None)
+            if isinstance(names, dict) and names:
+                res = {int(k): str(v).title() for k, v in names.items()}
+                _MODEL_CLASSES_CACHE[clean_name] = res
+                return res
+            elif isinstance(names, list) and names:
+                res = {i: str(v).title() for i, v in enumerate(names)}
+                _MODEL_CLASSES_CACHE[clean_name] = res
+                return res
+        except Exception:
+            pass
+
+    # 3. Fallback: load via load_yolo_model
+    try:
+        _, cmap = load_yolo_model(clean_name)
+        if cmap:
+            res = {cid: data["name"] for cid, data in cmap.items()}
+            _MODEL_CLASSES_CACHE[clean_name] = res
+            return res
+    except Exception:
+        pass
+
+    # 4. Ultimate fallback
+    return {cid: info["name"] for cid, info in DEFAULT_RDD_CLASSES.items()}
+
+
+def on_model_selection_change(model_name, master_conf=0.25):
+    """
+    Updates the per-class confidence threshold sliders when a new model is selected.
+    Dynamically shows sliders for the exact classes present in the model and hides unused sliders.
+    """
+    classes_dict = get_model_class_dict(model_name)
+    class_items = list(classes_dict.items())
+    num_classes = len(class_items)
+    val = float(master_conf) if master_conf else 0.25
+
+    updates = []
+    for i in range(MAX_CLASS_SLIDERS):
+        if i < num_classes:
+            cid, cname = class_items[i]
+            updates.append(gr.update(label=f"[{cid}] {cname}", value=val, visible=True))
+        else:
+            updates.append(gr.update(visible=False))
+
+    clean_name = os.path.basename(model_name) if model_name else "Selected Model"
+    info_text = f"🎯 **{num_classes} classes detected** for `{clean_name}`. Set independent confidence thresholds per class below:"
+    return [info_text] + updates
+
+
+def sync_all_class_sliders(model_name, target_conf=0.25):
+    """Syncs all active class confidence sliders to a given target confidence value."""
+    classes_dict = get_model_class_dict(model_name)
+    num_classes = len(classes_dict)
+    val = float(target_conf) if target_conf is not None else 0.25
+
+    updates = []
+    for i in range(MAX_CLASS_SLIDERS):
+        if i < num_classes:
+            updates.append(gr.update(value=val))
+        else:
+            updates.append(gr.update())
+    return updates
+
+
+def on_generate_geo(gpx_upload, gpx_dropdown, offset_sec, custom_output_dir=None):
+    """Event handler for generating GIS / GeoJSON enrichment."""
+    if not HAS_GIS_BACKEND:
+        return (
+            "❌ **GIS Module Unavailable**: `backend.geo_service` could not be loaded.",
+            "",
+            gr.update(visible=False)
+        )
+
+    gpx_path = None
+    if gpx_upload is not None:
+        if isinstance(gpx_upload, dict):
+            gpx_path = gpx_upload.get("path") or gpx_upload.get("name")
+        elif hasattr(gpx_upload, "name"):
+            gpx_path = gpx_upload.name
+        elif hasattr(gpx_upload, "path"):
+            gpx_path = gpx_upload.path
+        elif isinstance(gpx_upload, str):
+            gpx_path = gpx_upload
+
+    if not gpx_path and gpx_dropdown:
+        gpx_path = gpx_dropdown
+
+    if not gpx_path or not os.path.exists(gpx_path):
+        return (
+            "⚠️ **Missing GPX File**: Please upload a `.gpx` file or select one from the dropdown.",
+            "",
+            gr.update(visible=False)
+        )
+
+    if custom_output_dir and os.path.exists(custom_output_dir):
+        output_dir = custom_output_dir
+        summary_path = os.path.join(output_dir, "summary.json")
+        mp4_files = [f for f in os.listdir(output_dir) if f.startswith("output_video_") and f.endswith(".mp4")]
+        if not mp4_files:
+            mp4_files = [f for f in os.listdir(output_dir) if f.endswith(".mp4")]
+        video_path = os.path.join(output_dir, mp4_files[0]) if mp4_files else _GIS_STATE.get("last_video_path")
+    else:
+        video_path = _GIS_STATE.get("last_video_path")
+        output_dir = _GIS_STATE.get("last_output_dir")
+        summary_path = _GIS_STATE.get("last_summary_path")
+
+        # Smart fallback: if page was refreshed, auto-detect most recent inspection run from outputs/
+        if not output_dir or not os.path.exists(output_dir):
+            if os.path.exists(OUTPUTS_DIR):
+                recent_runs = [
+                    os.path.join(OUTPUTS_DIR, d)
+                    for d in os.listdir(OUTPUTS_DIR)
+                    if os.path.isdir(os.path.join(OUTPUTS_DIR, d)) and os.path.exists(os.path.join(OUTPUTS_DIR, d, "summary.json"))
+                ]
+                if recent_runs:
+                    recent_runs.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+                    output_dir = recent_runs[0]
+                    summary_path = os.path.join(output_dir, "summary.json")
+
+    if not output_dir or not os.path.exists(output_dir):
+        return (
+            "⚠️ **No Completed Inspection Run**: Please run a video inspection first or select a completed run from history.",
+            "",
+            gr.update(visible=False)
+        )
+
+    try:
+        res = enrich_inspection_with_gis(
+            video_path=video_path,
+            gpx_path=gpx_path,
+            summary_source=summary_path or output_dir,
+            output_dir=output_dir,
+            time_offset_seconds=float(offset_sec or 0.0),
+            embed_images_as_base64=True,
+        )
+
+        status_md = f"""
+### 🗺️ GIS Geolocation Enrichment Complete!
+- **Unique Road Defects Mapped**: `{res['total_defects']}`
+- **Survey Distance**: `{res['survey_distance_meters']:.1f} m` | **Duration**: `{res['survey_duration_seconds']:.1f}s`
+- **Video Stream**: `{res['video_fps']} FPS` (`{res['total_video_frames']} frames`)
+- **Synchronization**: {res['sync_info']}
+- **GeoJSON File**: `{os.path.basename(res['geojson_path'])}`
+"""
+        if res.get("warnings"):
+            status_md += "\\n**Notices:**\\n" + "\\n".join(f"- {w}" for w in res["warnings"][:3])
+
+        return (
+            status_md,
+            res["html_map"],
+            gr.update(value=res["geojson_path"], visible=True)
+        )
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return (
+            f"❌ **GIS Processing Error**: {e}",
+            "",
+            gr.update(visible=False)
+        )
+
+
+def on_generate_geo_history(selected_run, gpx_upload, gpx_dropdown, offset_sec):
+    """Event handler for generating GIS / GeoJSON enrichment for a historical run."""
+    if not selected_run:
+        return (
+            "⚠️ **No Past Run Selected**: Please select a run from the dropdown above.",
+            "",
+            gr.update(visible=False)
+        )
+    run_dir = os.path.join(OUTPUTS_DIR, selected_run)
+    return on_generate_geo(gpx_upload, gpx_dropdown, offset_sec, custom_output_dir=run_dir)
 
 
 def get_history_runs():
@@ -405,13 +733,14 @@ def get_history_runs():
 
 
 def load_history_details(selected_run_folder):
-    """Loads past analysis details (video, csv, crops gallery, summary markdown) for selected run."""
+    """Loads past analysis details (video, csv, crops gallery, summary markdown, and GIS map) for selected run."""
+    empty_gis_download = gr.update(visible=False)
     if not selected_run_folder:
-        return None, None, [], "Please select an analysis run from the dropdown.", []
+        return None, None, [], "Please select an analysis run from the dropdown.", [], [], "", "", empty_gis_download
 
     run_dir = os.path.join(OUTPUTS_DIR, selected_run_folder)
     if not os.path.exists(run_dir):
-        return None, None, [], f"❌ Error: Run directory '{selected_run_folder}' not found.", []
+        return None, None, [], f"❌ Error: Run directory '{selected_run_folder}' not found.", [], [], "", "", empty_gis_download
 
     # Locate output mp4 video
     mp4_files = [f for f in os.listdir(run_dir) if f.startswith("output_video_") and f.endswith(".mp4")]
@@ -425,17 +754,30 @@ def load_history_details(selected_run_folder):
         csv_files = [f for f in os.listdir(run_dir) if f.endswith(".csv")]
     csv_path = os.path.join(run_dir, csv_files[0]) if csv_files else None
 
-    # Locate crops
+    # Locate crops (limit to 60 for fast loading)
     crop_gallery = []
     crops_dir = os.path.join(run_dir, "crops")
     if os.path.exists(crops_dir):
-        for f in sorted(os.listdir(crops_dir)):
-            if f.lower().endswith(('.jpg', '.jpeg', '.png')):
-                crop_path = os.path.join(crops_dir, f)
-                crop_gallery.append((crop_path, f))
+        valid_crops = [f for f in sorted(os.listdir(crops_dir)) if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
+        for f in valid_crops[:60]:
+            crop_path = os.path.join(crops_dir, f)
+            crop_gallery.append((crop_path, f))
+            
+    # Locate segmentation masks (limit to 60 for fast loading)
+    segmentation_gallery = []
+    masks_dir = os.path.join(run_dir, "masks")
+    if os.path.exists(masks_dir):
+        valid_masks = [f for f in sorted(os.listdir(masks_dir)) if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
+        for f in valid_masks[:60]:
+            mask_path = os.path.join(masks_dir, f)
+            segmentation_gallery.append((mask_path, f))
 
     # Read summary.json or build summary markdown
     json_path = os.path.join(run_dir, "summary.json")
+    _GIS_STATE["last_output_dir"] = run_dir
+    _GIS_STATE["last_summary_path"] = json_path if os.path.exists(json_path) else None
+    if video_path and os.path.exists(video_path):
+        _GIS_STATE["last_video_path"] = video_path
     if os.path.exists(json_path):
         try:
             with open(json_path, "r", encoding="utf-8") as f:
@@ -455,14 +797,22 @@ def load_history_details(selected_run_folder):
 #### 🛠️ Defect Category Breakdown:
 """
             defect_counts = data.get("defect_counts", {})
-            defect_config = {
-                        "D00" : "Longituduinal Crack",
-                        "D10" : "Transverse Crack",
-                        "D20" : "Alligator Crack",
-                        "D40" : "Pothole"
-                    }
             for cls_name, count in defect_counts.items():
                 summary_md += f"- **{cls_name}**: `{count}` detected\n"
+
+            # Defect Area Measurements (Pothole, Manhole, Patch only)
+            past_defects = data.get("finalized_defects", [])
+            past_areas = [d for d in past_defects if (d.get("real_area_m2") or (isinstance(d.get("measurement_data"), dict) and d["measurement_data"].get("real_area_m2")))]
+            if past_areas:
+                summary_md += "\n#### 📐 Measured Defect Surface Areas (Pothole / Manhole / Patch):\n"
+                for d in past_areas[:15]:
+                    area_val = d.get("real_area_m2") or d.get("measurement_data", {}).get("real_area_m2")
+                    dtype = d.get("defect_type") or d.get("class_name") or "Defect"
+                    did = str(d.get("defect_id", ""))
+                    did_str = f" (`#{did[:8]}`)" if did else ""
+                    summary_md += f"- **{dtype}**{did_str}: **{float(area_val):.3f} m²**\n"
+                if len(past_areas) > 15:
+                    summary_md += f"- *...and {len(past_areas) - 15} more (see CSV for full defect logs)*\n"
         except Exception:
             summary_md = f"### 📜 Inspection Run: `{selected_run_folder}`\n\n*Loaded from `{run_dir}`*"
     else:
@@ -479,7 +829,30 @@ def load_history_details(selected_run_folder):
         except Exception as e:
             print(f"[Warning] Failed to load history visualization charts: {e}")
 
-    return video_path, csv_path, crop_gallery, summary_md, charts_gallery, []
+    # Check if GIS GeoJSON already exists for this past run
+    hist_map_html = ""
+    hist_gis_status = "Upload or select a `.gpx` survey track below and click **📍 Generate GEO Information** to map this past run."
+    hist_gis_download = gr.update(visible=False)
+
+    existing_geojson = os.path.join(run_dir, "defects.geojson")
+    if os.path.exists(existing_geojson) and HAS_GIS_BACKEND:
+        try:
+            with open(existing_geojson, "r", encoding="utf-8") as gf:
+                geo_data = json.load(gf)
+            from backend.geo_service import generate_leaflet_map_html
+            hist_map_html = generate_leaflet_map_html(geo_data)
+            num_pts = len([f for f in geo_data.get("features", []) if f.get("geometry", {}).get("type") == "Point"])
+            hist_gis_status = f"✅ **Loaded Existing GIS Map**: Found `{num_pts}` geolocated road defects from `{os.path.basename(existing_geojson)}`."
+            hist_gis_download = gr.update(value=existing_geojson, visible=True)
+        except Exception as e:
+            hist_map_html = ""
+            hist_gis_status = f"⚠️ Could not load existing `defects.geojson`: {e}"
+            hist_gis_download = gr.update(visible=False)
+
+    return (
+        video_path, csv_path, crop_gallery, summary_md, charts_gallery, segmentation_gallery,
+        hist_gis_status, hist_map_html, hist_gis_download
+    )
 
 
 def load_yolo_model(model_name):
@@ -524,6 +897,12 @@ def load_yolo_model(model_name):
 
 def estimate_video_info(video_path, frame_skip=1):
     """Calculates estimated processing time and video metadata before starting inference."""
+    if not video_path:
+        return ""
+    if isinstance(video_path, dict):
+        video_path = video_path.get("path") or video_path.get("name") or video_path.get("video", {}).get("path")
+    elif hasattr(video_path, "path"):
+        video_path = video_path.path
     if not video_path or not os.path.exists(video_path):
         return ""
 
@@ -635,50 +1014,90 @@ def on_toggle_dedup(enabled):
     return status_html, btn_label, row_visibility
 
 
+def on_toggle_openvino(is_openvino):
+    """Event handler when the user toggles OpenVINO model selection ON/OFF."""
+    choices = get_available_models(use_openvino=is_openvino)
+    val = choices[0] if choices else None
+    if is_openvino:
+        return gr.Dropdown(
+            choices=choices,
+            value=val,
+            label="OpenVINO Model Folder",
+            info="Select an OpenVINO model folder from models/"
+        )
+    else:
+        return gr.Dropdown(
+            choices=choices,
+            value=val,
+            label="Model Weights (.pt)",
+            info="Select a PyTorch .pt model file from models/"
+        )
+
+
 def process_video(video_path, model_name, conf_threshold, iou_threshold, frame_skip,
                   enable_dedup=True, merge_threshold=0.65, track_buffer=45,
-                  progress=gr.Progress()):
+                  enable_segmentation=True, cam_height=1.2, cam_tilt=15.0, cam_focal=1200.0,
+                  *slider_and_other_args, progress=gr.Progress()):
     """
-    Processes video for Road Damage Detection with integrated duplicate removal.
+    Processes video for Road Damage Detection with integrated duplicate removal
+    and real-world defect area calculation (Pothole, Manhole, Patch only).
+    Supports dynamic per-class custom confidence thresholds.
 
     When dedup is enabled, runs the full pipeline:
       YOLO + BoT-SORT tracking → TrackManager → DuplicateVerifier → DefectDatabase
 
     When dedup is disabled, falls back to the original frame-by-frame detection.
-
-    Saves outputs in outputs/analysis_TIMESTAMP/:
-      - Annotated Output Video (.mp4) with track IDs
-      - Unique Defects CSV Log (.csv)
-      - Deduplicated Defect Crops (crops/*.jpg)
-      - Summary Report with dedup statistics
-      - Merge audit log (merge_audit_log.json)
-      - SQLite defect database (defects.db)
     """
+    if isinstance(video_path, dict):
+        video_path = video_path.get("path") or video_path.get("name") or video_path.get("video", {}).get("path")
+    elif hasattr(video_path, "path"):
+        video_path = video_path.path
     if not video_path or not os.path.exists(video_path):
         return None, None, [], "❌ Error: Invalid or missing video input file.", [], []
 
     # Reset revocation flag for new processing session
     _CANCEL_FLAG["requested"] = False
 
+    # Extract dynamic per-class confidence thresholds
+    slider_values = list(slider_and_other_args[:MAX_CLASS_SLIDERS])
+    classes_dict = get_model_class_dict(model_name)
+    class_items = list(classes_dict.items())
+    custom_class_thresholds = {}
+    for i, (cid, cname) in enumerate(class_items):
+        if i < len(slider_values) and slider_values[i] is not None:
+            val = float(slider_values[i])
+        else:
+            val = float(conf_threshold or 0.25)
+        custom_class_thresholds[cname] = val
+        custom_class_thresholds[str(cname).upper()] = val
+        custom_class_thresholds[cid] = val
+
     # ── Dedup Pipeline Path ──
     if enable_dedup and HAS_DEDUP_PIPELINE and "Demo" not in model_name:
         return _process_video_with_dedup(
             video_path, model_name, conf_threshold, iou_threshold,
-            frame_skip, merge_threshold, track_buffer, progress
+            frame_skip, merge_threshold, track_buffer, enable_segmentation,
+            cam_height, cam_tilt, cam_focal,
+            custom_class_thresholds, progress
         )
 
     # ── Fallback: Original frame-by-frame detection (no tracking/dedup) ──
     return _process_video_legacy(
         video_path, model_name, conf_threshold, iou_threshold,
-        frame_skip, progress
+        frame_skip, progress, custom_class_thresholds,
+        cam_height, cam_tilt, cam_focal
     )
 
 
 def _process_video_with_dedup(video_path, model_name, conf_threshold, iou_threshold,
-                              frame_skip, merge_threshold, track_buffer, progress):
+                              frame_skip, merge_threshold, track_buffer, enable_segmentation,
+                              cam_height, cam_tilt, cam_focal,
+                              custom_class_thresholds, progress):
     """
     Full dedup pipeline: YOLO + BoT-SORT + TrackManager + DuplicateVerifier.
-    Returns the same 4 outputs as the original process_video for Gradio compatibility.
+    Applies custom per-class confidence filtering dynamically.
+    Estimates real-world ground area (m²) for Pothole, Manhole, and Patch.
+    Returns the same 6 outputs as the original process_video for Gradio compatibility.
     """
     # Configure logging
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -696,13 +1115,22 @@ def _process_video_with_dedup(video_path, model_name, conf_threshold, iou_thresh
     elif os.path.exists(os.path.join(MODELS_DIR, "rdd_yolo.pt")):
         model_path = "models/rdd_yolo.pt"
 
+    # Determine base confidence threshold for YOLO detector
+    valid_thresholds = [v for v in custom_class_thresholds.values() if isinstance(v, (int, float))] if custom_class_thresholds else []
+    base_conf = min(valid_thresholds) if valid_thresholds else float(conf_threshold)
+    base_conf = max(0.05, min(base_conf, float(conf_threshold)))
+
     config = PipelineConfig(
         model_path=model_path,
-        confidence_threshold=conf_threshold,
+        confidence_threshold=base_conf,
         iou_threshold=iou_threshold,
         frame_skip=int(frame_skip),
         merge_threshold=merge_threshold,
         track_buffer_frames=int(track_buffer),
+        enable_segmentation=enable_segmentation,
+        camera_height_m=float(cam_height or 1.2),
+        camera_tilt_deg=float(cam_tilt or 15.0),
+        camera_focal_length_px=float(cam_focal) if cam_focal else None,
         save_annotated_video=True,
         save_crops=True,
         database_type="sqlite",
@@ -711,6 +1139,27 @@ def _process_video_with_dedup(video_path, model_name, conf_threshold, iou_thresh
 
     # Create pipeline and run
     pipeline = RDDPipeline(config=config)
+
+    # Wrap pipeline.detector.detect_and_track with per-class threshold filter
+    orig_detect_and_track = pipeline.detector.detect_and_track
+    def filtered_detect_and_track(frame, frame_idx):
+        dets = orig_detect_and_track(frame, frame_idx)
+        if not custom_class_thresholds:
+            return dets
+        filtered = []
+        for d in dets:
+            thresh = custom_class_thresholds.get(
+                d.class_name,
+                custom_class_thresholds.get(
+                    str(d.class_name).upper(),
+                    custom_class_thresholds.get(d.class_id, float(conf_threshold))
+                )
+            )
+            if d.confidence >= thresh:
+                filtered.append(d)
+        return filtered
+    pipeline.detector.detect_and_track = filtered_detect_and_track
+
     start_time = time.time()
 
     def gradio_progress_callback(fraction, message):
@@ -742,6 +1191,12 @@ def _process_video_with_dedup(video_path, model_name, conf_threshold, iou_thresh
     _ANNOTATION_STATE["last_pipeline_result"] = result
     _ANNOTATION_STATE["last_video_path"] = video_path
     _ANNOTATION_STATE["last_inspection_mode"] = "dedup"
+
+    # Store result for GIS enrichment
+    _GIS_STATE["last_video_path"] = video_path
+    _GIS_STATE["last_output_dir"] = result.output_dir
+    _GIS_STATE["last_summary_path"] = os.path.join(result.output_dir, "summary.json")
+    _GIS_STATE["last_pipeline_result"] = result
 
     # ── Convert outputs to Gradio format ──
 
@@ -831,10 +1286,32 @@ def _process_video_with_dedup(video_path, model_name, conf_threshold, iou_thresh
     for cls_name, count in sorted(result.defect_counts.items()):
         summary_md += f"- **{cls_name}**: `{count}` unique defects\n"
 
+    # Defect Area Measurements (Pothole, Manhole, Patch only)
+    area_entries = []
+    if hasattr(result, "finalized_defects"):
+        for d in result.finalized_defects:
+            if getattr(d, "real_area_m2", None) is not None and d.real_area_m2 > 0:
+                area_entries.append(f"- **{d.defect_type}** (`#{d.defect_id[:8]}`): **{d.real_area_m2:.3f} m²** (observed across {d.frames_observed} frames)")
+    if area_entries:
+        summary_md += "\n#### 📐 Real-World Defect Area Measurements (Pothole / Manhole / Patch):\n"
+        summary_md += f"*Camera Height: `{cam_height}m` · Downward Tilt: `{cam_tilt}°` · Focal Length: `{cam_focal}px`*\n\n"
+        for line in area_entries[:15]:
+            summary_md += f"{line}\n"
+        if len(area_entries) > 15:
+            summary_md += f"- *...and {len(area_entries) - 15} more defects (see CSV / GeoJSON for full list)*\n"
+
+    # Build per-class threshold display string
+    c_th_items = []
+    for cname, th in custom_class_thresholds.items():
+        if isinstance(cname, str) and not cname.isupper() and isinstance(th, (int, float)):
+            c_th_items.append(f"`{cname}`: **{th:.2f}**")
+    c_th_str = " · ".join(c_th_items) if c_th_items else f"`{conf_threshold}`"
+
     summary_md += f"""
 ---
 #### ⚙️ Pipeline Configuration
-- Confidence Threshold: `{conf_threshold}`
+- Global Master Confidence: `{conf_threshold}`
+- Per-Class Thresholds: {c_th_str}
 - IoU Threshold: `{iou_threshold}`
 - Merge Threshold: `{merge_threshold}`
 - Track Buffer: `{int(track_buffer)} frames`
@@ -860,7 +1337,7 @@ def _process_video_with_dedup(video_path, model_name, conf_threshold, iou_thresh
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# RDD_Ahmedabad Dataset Builder — Backend Functions
+# RDD_Ahmedabad Dataset Builder — Backend Functions (Staged Workflow)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def prepare_annotation_candidates():
@@ -885,12 +1362,119 @@ def prepare_annotation_candidates():
 
     _ANNOTATION_STATE["candidates"] = candidates
     _ANNOTATION_STATE["current_index"] = 0
+    _ANNOTATION_STATE["staged_defects"] = []
+    _ANNOTATION_STATE["next_staged_id"] = 1
+    _ANNOTATION_STATE["editing_staged_id"] = None
     _ANNOTATION_STATE["accepted_count"] = 0
     _ANNOTATION_STATE["skipped_count"] = 0
     _ANNOTATION_STATE["changed_count"] = 0
 
     mode_label = "Deduplicated" if mode == "dedup" else "Raw Detections (No Dedup)"
     return f"✅ {len(candidates)} defect crops ready for review ({mode_label}).", len(candidates)
+
+
+def prepare_image_annotation_candidates(image_files):
+    """
+    Load one or more uploaded image files into Stage 1 of Dataset Builder for manual crop and annotation.
+    Allows selecting multiple images at once, stepping through them sequentially, cropping each defect,
+    assigning defect classes, and staging them for batch commit.
+    Returns: (status_message, total_count)
+    """
+    if image_files is None:
+        return "❌ No image files provided.", 0
+
+    if not HAS_DATASET_SYSTEM:
+        return "❌ Dataset system not available. Check configs/rdd_ahmedabad_classes.yaml.", 0
+
+    # Normalize to list
+    if not isinstance(image_files, (list, tuple)):
+        file_list = [image_files]
+    else:
+        file_list = list(image_files)
+
+    if not file_list:
+        return "❌ No images provided in upload.", 0
+
+    default_class = "POTHOLE"
+    default_cid = 0
+    if RDD_CLASS_CONFIG:
+        valid_names = RDD_CLASS_CONFIG.get_class_names()
+        if valid_names:
+            default_class = valid_names[0]
+            default_cid = RDD_CLASS_CONFIG.get_class_id(default_class)
+
+    candidates = []
+    loaded_filenames = []
+
+    for idx, item in enumerate(file_list):
+        image_path = None
+        if isinstance(item, str):
+            image_path = item
+        elif hasattr(item, "name"):
+            image_path = item.name
+        elif isinstance(item, dict):
+            image_path = item.get("path") or item.get("name")
+
+        if not image_path or not os.path.exists(image_path):
+            continue
+
+        frame_bgr = cv2.imread(image_path)
+        if frame_bgr is None:
+            try:
+                with open(image_path, "rb") as f:
+                    buf = np.frombuffer(f.read(), dtype=np.uint8)
+                    frame_bgr = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+            except Exception:
+                pass
+
+        if frame_bgr is None or frame_bgr.size == 0:
+            continue
+
+        h, w = frame_bgr.shape[:2]
+        image_filename = os.path.basename(image_path)
+        image_stem = os.path.splitext(image_filename)[0]
+        loaded_filenames.append(image_filename)
+
+        bw = max(20, int(w * 0.40))
+        bh = max(20, int(h * 0.40))
+        cx, cy = w // 2, h // 2
+        bx1 = max(0, cx - bw // 2)
+        by1 = max(0, cy - bh // 2)
+        bx2 = min(w, bx1 + bw)
+        by2 = min(h, by1 + bh)
+
+        crop = frame_bgr[by1:by2, bx1:bx2].copy()
+        cand = CandidateAnnotation(
+            crop_image=crop,
+            original_frame=frame_bgr.copy(),
+            bbox=(bx1, by1, bx2, by2),
+            initial_bbox=(bx1, by1, bx2, by2),
+            class_id=default_cid,
+            class_name=default_class,
+            predicted_class="Manual Crop",
+            confidence=1.0,
+            frame_number=1,
+            track_id=idx + 1,
+            source_video=image_filename,
+            defect_id=f"img_{image_stem}_{idx+1}"
+        )
+        candidates.append(cand)
+
+    if not candidates:
+        return "❌ Failed to decode the uploaded image(s). Please upload valid JPG or PNG files.", 0
+
+    _ANNOTATION_STATE["candidates"] = candidates
+    _ANNOTATION_STATE["current_index"] = 0
+    _ANNOTATION_STATE["editing_staged_id"] = None
+    _ANNOTATION_STATE["last_video_path"] = loaded_filenames[0]
+    _ANNOTATION_STATE["last_inspection_mode"] = "batch_image" if len(candidates) > 1 else "single_image"
+
+    if len(candidates) == 1:
+        status_msg = f"🖼️ Image `{loaded_filenames[0]}` loaded. Adjust the crop box on the canvas, assign class, and click **Accept Defect**."
+    else:
+        status_msg = f"🖼️ **{len(candidates)} images loaded for defect cropping!** Crop Image #1 on the canvas and click **Accept Defect** (or **Add Another in Frame** for multiple defects per image)."
+
+    return status_msg, len(candidates)
 
 
 def get_current_candidate_display():
@@ -900,27 +1484,12 @@ def get_current_candidate_display():
     """
     candidates = _ANNOTATION_STATE.get("candidates", [])
     idx = _ANNOTATION_STATE.get("current_index", 0)
+    staged = _ANNOTATION_STATE.get("staged_defects", [])
+    skipped = _ANNOTATION_STATE.get("skipped_count", 0)
+    mode = _ANNOTATION_STATE.get("last_inspection_mode", "")
 
     if not candidates or idx >= len(candidates):
-        # Session complete
-        accepted = _ANNOTATION_STATE.get("accepted_count", 0)
-        skipped = _ANNOTATION_STATE.get("skipped_count", 0)
-        changed = _ANNOTATION_STATE.get("changed_count", 0)
-        stats_md = RDD_DATASET_MANAGER.get_stats_markdown() if RDD_DATASET_MANAGER else ""
-        done_md = f"""
-### ✅ Dataset Collection Complete!
-
-| Action | Count |
-|---|---|
-| Accepted | **{accepted}** |
-| Class Changed | **{changed}** |
-| Skipped | **{skipped}** |
-| Total Reviewed | **{accepted + skipped}** |
-
----
-{stats_md}
-"""
-        return None, done_md, "", f"Done — {accepted + skipped}/{len(candidates)} reviewed", True
+        return None, "All candidates reviewed.", "", f"Review Complete — Staged: {len(staged)} | Skipped: {skipped}", True
 
     c = candidates[idx]
 
@@ -928,40 +1497,128 @@ def get_current_candidate_display():
     suggested = c.class_name
     if RDD_CLASS_CONFIG:
         suggested = RDD_CLASS_CONFIG.map_model_class(c.predicted_class)
-    
-    # Ensure uppercase matching dropdown options
-    if isinstance(suggested, str):
-        suggested = suggested.upper()
+
+    valid_classes = RDD_CLASS_CONFIG.get_class_names() if RDD_CLASS_CONFIG else []
+
+    # Normalize suggested class name
+    norm_suggested = suggested.strip().upper().replace(" ", "_").replace("-", "_") if isinstance(suggested, str) else ""
+
+    resolved_class = None
+    if valid_classes and norm_suggested in valid_classes:
+        resolved_class = norm_suggested
+    elif valid_classes and norm_suggested.endswith("S") and norm_suggested[:-1] in valid_classes:
+        resolved_class = norm_suggested[:-1]
+    elif valid_classes and (norm_suggested + "S") in valid_classes:
+        resolved_class = norm_suggested + "S"
+    elif valid_classes and c.class_name:
+        cand_norm = c.class_name.strip().upper().replace(" ", "_").replace("-", "_")
+        if cand_norm in valid_classes:
+            resolved_class = cand_norm
+
+    is_manual = (c.predicted_class in ("Manual", "Manual Crop") or mode in ("single_image", "batch_image"))
+    is_unresolved = (resolved_class is None and not is_manual)
+
+    if is_unresolved:
+        dropdown_val = None
+        suggested_display = f"<span style='color:#ef4444;font-weight:bold;'>⚠️ UNRESOLVED (`{c.predicted_class}`)</span>"
+        warning_banner = f"""
+> [!WARNING]
+> ⚠️ **UNRESOLVED DEFECT CLASS — ACTION REQUIRED**  
+> The model prediction `{c.predicted_class}` does not match any known RDD_Ahmedabad class.  
+> **You MUST explicitly select a valid class from the 'Assign Class' dropdown before accepting this defect.**
+"""
+        progress_suffix = " ⚠️ UNRESOLVED CLASS"
+    else:
+        dropdown_val = resolved_class or valid_classes[0] if valid_classes else "POTHOLE"
+        suggested_display = f"`{dropdown_val}`"
+        warning_banner = ""
+        progress_suffix = ""
+
+    header_label = f"Image #{idx + 1} of {len(candidates)}" if is_manual else f"Detection #{idx + 1} / {len(candidates)}"
+    conf_pill = f'<span class="ds-conf-pill" style="background:rgba(56,189,248,0.15);color:#38bdf8;">Manual Crop</span>' if is_manual else f'<span class="ds-conf-pill">{c.confidence:.0%} conf</span>'
 
     info_md = f"""
-### Detection #{idx + 1} / {len(candidates)}
-
-| Field | Value |
-|---|---|
-| **Predicted Class** | `{c.predicted_class}` |
-| **Suggested (RDD_Ahmedabad)** | `{suggested}` |
-| **Confidence** | `{c.confidence:.2f}` |
-| **Frame** | `{c.frame_number}` |
-| **Track ID** | `{c.track_id}` |
-| **Source Video** | `{c.source_video}` |
-| **Bbox** | `{c.bbox}` |
+{warning_banner}
+<div class="ds-candidate-card">
+  <div class="ds-card-row">
+    <span class="ds-detection-num">{header_label}</span>
+    {conf_pill}
+  </div>
+  <div class="ds-meta-grid">
+    <div class="ds-meta-item"><span class="ds-meta-lbl">Type:</span> <span class="ds-meta-val"><code>{c.predicted_class}</code></span></div>
+    <div class="ds-meta-item"><span class="ds-meta-lbl">Assigned:</span> <span class="ds-meta-val">{suggested_display}</span></div>
+  </div>
+  <details class="ds-details-accordion">
+    <summary>📋 Details (Image, Dimensions, Bbox)</summary>
+    <div class="ds-details-content">
+      <div style="grid-column: span 2;"><b>Source:</b> <code>{c.source_video}</code></div>
+      <div><b>Bbox Coords:</b> <code>{c.bbox}</code></div>
+      <div><b>Size:</b> <code>{c.bbox[2]-c.bbox[0]}x{c.bbox[3]-c.bbox[1]} px</code></div>
+    </div>
+  </details>
+</div>
 """
-
-    accepted = _ANNOTATION_STATE.get("accepted_count", 0)
-    skipped = _ANNOTATION_STATE.get("skipped_count", 0)
-    progress_text = f"Crop {idx + 1} / {len(candidates)} | Accepted: {accepted} | Skipped: {skipped}"
+    if is_manual:
+        progress_text = f"Image {idx + 1} of {len(candidates)} — Staged: {len(staged)} | Skipped: {skipped}{progress_suffix}"
+    else:
+        progress_text = f"Candidate {idx + 1} / {len(candidates)}{progress_suffix} | Staged: {len(staged)} | Skipped: {skipped}"
 
     # Convert BGR crop to RGB for Gradio display
     crop_rgb = None
-    if c.crop_image is not None:
+    if c.crop_image is not None and c.crop_image.size > 0:
         crop_rgb = cv2.cvtColor(c.crop_image, cv2.COLOR_BGR2RGB)
 
-    return crop_rgb, info_md, suggested, progress_text, False
+    return crop_rgb, info_md, dropdown_val, progress_text, False
 
 
-def accept_annotation(chosen_class):
+def _resolve_bbox(candidate_or_defect, explicit_bbox=None):
     """
-    Accept the current candidate with the chosen class and save to dataset.
+    Resolve and validate a bounding box for a candidate annotation or staged defect dict.
+    - If explicit_bbox is provided: validate against frame dimensions (clamp to [0, width] / [0, height]),
+      reject if x2 <= x1 or y2 <= y1, and return (int(x1), int(y1), int(x2), int(y2)).
+    - Otherwise: fall back to initial_bbox (never live-mutated bbox).
+    """
+    frame = None
+    initial_bbox = None
+    fallback_bbox = None
+
+    if isinstance(candidate_or_defect, dict):
+        frame = candidate_or_defect.get("original_frame")
+        initial_bbox = candidate_or_defect.get("initial_bbox")
+        fallback_bbox = candidate_or_defect.get("bbox")
+    elif candidate_or_defect is not None:
+        frame = getattr(candidate_or_defect, "original_frame", None)
+        initial_bbox = getattr(candidate_or_defect, "initial_bbox", None)
+        fallback_bbox = getattr(candidate_or_defect, "bbox", None)
+
+    if explicit_bbox is not None:
+        try:
+            bx1, by1, bx2, by2 = [float(v) for v in explicit_bbox]
+            if frame is not None and hasattr(frame, "shape"):
+                h, w = frame.shape[:2]
+                bx1 = max(0.0, min(float(w), bx1))
+                by1 = max(0.0, min(float(h), by1))
+                bx2 = max(0.0, min(float(w), bx2))
+                by2 = max(0.0, min(float(h), by2))
+
+            ix1, iy1, ix2, iy2 = int(round(bx1)), int(round(by1)), int(round(bx2)), int(round(by2))
+            if ix2 > ix1 and iy2 > iy1:
+                return (ix1, iy1, ix2, iy2)
+        except Exception:
+            pass
+
+    # Fall back to initial_bbox (never live-mutated bbox if initial_bbox exists)
+    if initial_bbox is not None:
+        return tuple(int(round(v)) for v in initial_bbox)
+    if fallback_bbox is not None:
+        return tuple(int(round(v)) for v in fallback_bbox)
+    return (0, 0, 0, 0)
+
+
+def stage_candidate_annotation(chosen_class, bbox=None):
+    """
+    Stage the current candidate in memory (does NOT write to dataset yet).
+    Advances to the next candidate.
     Returns: next candidate display tuple.
     """
     candidates = _ANNOTATION_STATE.get("candidates", [])
@@ -971,65 +1628,71 @@ def accept_annotation(chosen_class):
         return get_current_candidate_display()
 
     c = candidates[idx]
-
-    if not RDD_CLASS_CONFIG or not RDD_DATASET_MANAGER or not RDD_ANNOTATION_MANAGER:
-        _ANNOTATION_STATE["current_index"] = idx + 1
-        return get_current_candidate_display()
+    final_bbox = _resolve_bbox(c, explicit_bbox=bbox)
 
     # Resolve class
-    class_name = chosen_class.strip().upper() if chosen_class else c.class_name
-    class_id = RDD_CLASS_CONFIG.get_class_id(class_name)
-    if class_id < 0:
-        class_id = 0
-        class_name = RDD_CLASS_CONFIG.get_class_name(0)
+    raw_choice = chosen_class.strip() if chosen_class else ""
+    mapped_choice = RDD_CLASS_CONFIG.map_model_class(raw_choice) if (RDD_CLASS_CONFIG and raw_choice) else raw_choice
+    class_id = RDD_CLASS_CONFIG.get_class_id(mapped_choice) if (RDD_CLASS_CONFIG and mapped_choice) else -1
+    if class_id >= 0 and RDD_CLASS_CONFIG:
+        class_name = RDD_CLASS_CONFIG.get_class_name(class_id)
+    else:
+        cand_raw = c.class_name or c.predicted_class or ""
+        cand_mapped = RDD_CLASS_CONFIG.map_model_class(cand_raw) if (RDD_CLASS_CONFIG and cand_raw) else cand_raw
+        cand_id = RDD_CLASS_CONFIG.get_class_id(cand_mapped) if (RDD_CLASS_CONFIG and cand_mapped and not raw_choice) else -1
+        if cand_id >= 0 and RDD_CLASS_CONFIG and not raw_choice:
+            class_id = cand_id
+            class_name = RDD_CLASS_CONFIG.get_class_name(class_id)
+        else:
+            # DO NOT DEFAULT TO POTHOLE! Keep class_id = -1 and original unresolved string
+            class_id = -1
+            class_name = raw_choice.upper() if raw_choice else (c.predicted_class or c.class_name or "UNRESOLVED")
 
-    # Track if class was changed
-    original_suggested = RDD_CLASS_CONFIG.map_model_class(c.predicted_class)
-    if class_name != original_suggested:
-        _ANNOTATION_STATE["changed_count"] = _ANNOTATION_STATE.get("changed_count", 0) + 1
+    # Track changed class
+    if RDD_CLASS_CONFIG:
+        original_suggested = RDD_CLASS_CONFIG.map_model_class(c.predicted_class)
+        if class_name != original_suggested:
+            _ANNOTATION_STATE["changed_count"] = _ANNOTATION_STATE.get("changed_count", 0) + 1
 
-    # Save to dataset
-    saved = RDD_DATASET_MANAGER.add_annotation(
-        frame=c.original_frame,
-        bbox=c.bbox,
-        class_id=class_id,
-        class_name=class_name,
-        source_video=c.source_video,
-        frame_number=c.frame_number,
-        track_id=c.track_id,
-        confidence=c.confidence,
-        crop_image=c.crop_image,
-    )
+    # Extract clean crop copy using final_bbox
+    crop_copy = None
+    if c.original_frame is not None:
+        x1, y1, x2, y2 = final_bbox
+        h, w = c.original_frame.shape[:2]
+        crop_copy = c.original_frame[max(0, y1):min(h, y2), max(0, x1):min(w, x2)].copy()
+    if crop_copy is None or crop_copy.size == 0:
+        crop_copy = c.crop_image.copy() if c.crop_image is not None and c.crop_image.size > 0 else None
 
-    # Record metadata
-    x1, y1, x2, y2 = c.bbox
-    RDD_ANNOTATION_MANAGER.add_record(
-        image_name=saved.get("image_filename", ""),
-        crop_name=saved.get("crop_filename", ""),
-        class_id=class_id,
-        class_name=class_name,
-        confidence=c.confidence,
-        source_video=c.source_video,
-        frame_number=c.frame_number,
-        track_id=c.track_id,
-        bbox_x=x1,
-        bbox_y=y1,
-        bbox_width=x2 - x1,
-        bbox_height=y2 - y1,
-        split=saved.get("split", "train"),
-    )
+    staged_id = _ANNOTATION_STATE["next_staged_id"]
+    _ANNOTATION_STATE["next_staged_id"] += 1
 
-    _ANNOTATION_STATE["accepted_count"] = _ANNOTATION_STATE.get("accepted_count", 0) + 1
+    staged_item = {
+        "id": staged_id,
+        "crop_image": crop_copy,
+        "original_frame": c.original_frame.copy() if c.original_frame is not None else None,
+        "bbox": final_bbox,
+        "initial_bbox": tuple(c.initial_bbox),
+        "class_id": class_id,
+        "class_name": class_name,
+        "predicted_class": c.predicted_class,
+        "confidence": float(c.confidence),
+        "source_video": c.source_video,
+        "frame_number": c.frame_number,
+        "track_id": c.track_id,
+    }
+
+    _ANNOTATION_STATE["staged_defects"].append(staged_item)
+    _ANNOTATION_STATE["accepted_count"] = len(_ANNOTATION_STATE["staged_defects"])
     _ANNOTATION_STATE["current_index"] = idx + 1
 
     return get_current_candidate_display()
 
 
-def add_another_defect_annotation(chosen_class):
+def stage_another_defect_annotation(chosen_class, bbox=None):
     """
-    Accept the current candidate's bounding box and class, save it,
-    but DO NOT advance to the next candidate frame. This allows adding
-    multiple defects in the same frame manually.
+    Stage the current candidate's bounding box and class in memory,
+    but DO NOT advance to next candidate frame. Allows staging multiple
+    defects in the same frame.
     """
     candidates = _ANNOTATION_STATE.get("candidates", [])
     idx = _ANNOTATION_STATE.get("current_index", 0)
@@ -1038,52 +1701,69 @@ def add_another_defect_annotation(chosen_class):
         return get_current_candidate_display()
 
     c = candidates[idx]
-
-    if not RDD_CLASS_CONFIG or not RDD_DATASET_MANAGER or not RDD_ANNOTATION_MANAGER:
-        return get_current_candidate_display()
+    final_bbox = _resolve_bbox(c, explicit_bbox=bbox)
 
     # Resolve class
-    class_name = chosen_class.strip().upper() if chosen_class else c.class_name
-    class_id = RDD_CLASS_CONFIG.get_class_id(class_name)
-    if class_id < 0:
-        class_id = 0
-        class_name = RDD_CLASS_CONFIG.get_class_name(0)
+    raw_choice = chosen_class.strip() if chosen_class else ""
+    mapped_choice = RDD_CLASS_CONFIG.map_model_class(raw_choice) if (RDD_CLASS_CONFIG and raw_choice) else raw_choice
+    class_id = RDD_CLASS_CONFIG.get_class_id(mapped_choice) if (RDD_CLASS_CONFIG and mapped_choice) else -1
+    if class_id >= 0 and RDD_CLASS_CONFIG:
+        class_name = RDD_CLASS_CONFIG.get_class_name(class_id)
+    else:
+        cand_raw = c.class_name or c.predicted_class or ""
+        cand_mapped = RDD_CLASS_CONFIG.map_model_class(cand_raw) if (RDD_CLASS_CONFIG and cand_raw) else cand_raw
+        cand_id = RDD_CLASS_CONFIG.get_class_id(cand_mapped) if (RDD_CLASS_CONFIG and cand_mapped and not raw_choice) else -1
+        if cand_id >= 0 and RDD_CLASS_CONFIG and not raw_choice:
+            class_id = cand_id
+            class_name = RDD_CLASS_CONFIG.get_class_name(class_id)
+        else:
+            # DO NOT DEFAULT TO POTHOLE! Keep class_id = -1 and original unresolved string
+            class_id = -1
+            class_name = raw_choice.upper() if raw_choice else (c.predicted_class or c.class_name or "UNRESOLVED")
 
-    # Save to dataset (use 1.0 confidence since it is manual)
-    saved = RDD_DATASET_MANAGER.add_annotation(
-        frame=c.original_frame,
-        bbox=c.bbox,
-        class_id=class_id,
-        class_name=class_name,
-        source_video=c.source_video,
-        frame_number=c.frame_number,
-        track_id=c.track_id,
-        confidence=1.0,
-        crop_image=c.crop_image,
-    )
+    # Extract clean crop copy using final_bbox
+    crop_copy = None
+    if c.original_frame is not None:
+        x1, y1, x2, y2 = final_bbox
+        h, w = c.original_frame.shape[:2]
+        crop_copy = c.original_frame[max(0, y1):min(h, y2), max(0, x1):min(w, x2)].copy()
+    if crop_copy is None or crop_copy.size == 0:
+        crop_copy = c.crop_image.copy() if c.crop_image is not None and c.crop_image.size > 0 else None
 
-    # Record metadata
-    x1, y1, x2, y2 = c.bbox
-    RDD_ANNOTATION_MANAGER.add_record(
-        image_name=saved.get("image_filename", ""),
-        crop_name=saved.get("crop_filename", ""),
-        class_id=class_id,
-        class_name=class_name,
-        confidence=1.0,
-        source_video=c.source_video,
-        frame_number=c.frame_number,
-        track_id=c.track_id,
-        bbox_x=x1,
-        bbox_y=y1,
-        bbox_width=x2 - x1,
-        bbox_height=y2 - y1,
-        split=saved.get("split", "train"),
-    )
+    staged_id = _ANNOTATION_STATE["next_staged_id"]
+    _ANNOTATION_STATE["next_staged_id"] += 1
 
-    _ANNOTATION_STATE["accepted_count"] = _ANNOTATION_STATE.get("accepted_count", 0) + 1
+    staged_item = {
+        "id": staged_id,
+        "crop_image": crop_copy,
+        "original_frame": c.original_frame.copy() if c.original_frame is not None else None,
+        "bbox": final_bbox,
+        "initial_bbox": final_bbox,
+        "class_id": class_id,
+        "class_name": class_name,
+        "predicted_class": c.predicted_class,
+        "confidence": 1.0,  # Manual addition
+        "source_video": c.source_video,
+        "frame_number": c.frame_number,
+        "track_id": c.track_id,
+    }
+
+    _ANNOTATION_STATE["staged_defects"].append(staged_item)
+    _ANNOTATION_STATE["accepted_count"] = len(_ANNOTATION_STATE["staged_defects"])
+
+    # Reset active candidate's c.bbox back to c.initial_bbox so primary candidate stays intact
+    c.bbox = tuple(c.initial_bbox)
+    if c.original_frame is not None:
+        ix1, iy1, ix2, iy2 = [int(v) for v in c.initial_bbox]
+        c.crop_image = c.original_frame[iy1:iy2, ix1:ix2].copy()
 
     # Return same candidate display without advancing
     return get_current_candidate_display()
+
+
+# Backwards compatibility aliases
+accept_annotation = stage_candidate_annotation
+add_another_defect_annotation = stage_another_defect_annotation
 
 
 def skip_annotation():
@@ -1093,11 +1773,866 @@ def skip_annotation():
     return get_current_candidate_display()
 
 
+def previous_annotation():
+    """Step back to the previous candidate if available."""
+    idx = _ANNOTATION_STATE.get("current_index", 0)
+    if idx > 0:
+        _ANNOTATION_STATE["current_index"] = idx - 1
+    return get_current_candidate_display()
+
+
+def get_staged_review_data():
+    """
+    Generate review data, confirmation prompt, distribution table, gallery items, and dropdown choices.
+    """
+    staged = _ANNOTATION_STATE.get("staged_defects", [])
+    candidates = _ANNOTATION_STATE.get("candidates", [])
+    skipped = _ANNOTATION_STATE.get("skipped_count", 0)
+
+    if not staged:
+        prompt_md = """### ⚠️ No Defects Staged
+No defect crops were accepted during this review session.
+Click **↩️ Return to Candidate Review** to review candidates and accept defects, or load another inspection run."""
+        dist_md = "<div style='color:#94a3b8;padding:12px;'>0 defects staged.</div>"
+        gallery_items = []
+        choices = []
+        return prompt_md, dist_md, gallery_items, choices
+
+    unresolved_count = sum(1 for d in staged if d.get("class_id", -1) < 0)
+    unresolved_warning = ""
+    if unresolved_count > 0:
+        unresolved_warning = f"""
+> [!CAUTION]
+> ⚠️ **ACTION REQUIRED: {unresolved_count} staged defect(s) have an UNRESOLVED class!**  
+> Staged defects with an unresolved class are marked with ⚠️. You must expand the **Defect Editor** below to select and assign a valid class for each one. Unresolved defects will be skipped and NOT written to the dataset.
+"""
+
+    prompt_md = f"""### 📋 Review & Confirmation
+{unresolved_warning}
+You have finished reviewing candidate detections from this inspection.
+
+> ❓ **Do you want to edit what you have done?**
+> - **Total Staged Defects**: **{len(staged)}**
+> - **Total Skipped**: **{skipped}**
+> 
+> Inspect the selected defect crops and their class distribution below. If you want to **edit a specific defect image** (adjust bounding box margins/coordinates or change class) or **remove it**, expand the **Defect Editor** below.
+>
+> When you are satisfied with all defects, click **💾 Confirm & Add to RDD_Ahmedabad Dataset** to permanently commit them!
+"""
+
+    class_counts = collections.Counter(d["class_name"] for d in staged)
+    dist_rows = "\n".join([f"| **{c_name}** | `{count}` crops |" for c_name, count in sorted(class_counts.items())])
+    dist_md = f"""#### 📊 Staged Defect Distribution ({len(staged)} Total)
+
+| Defect Class | Staged Count |
+|---|---|
+{dist_rows}
+"""
+
+    gallery_items = []
+    choices = []
+    for d in staged:
+        crop_rgb = None
+        if d.get("crop_image") is not None and d["crop_image"].size > 0:
+            crop_rgb = cv2.cvtColor(d["crop_image"], cv2.COLOR_BGR2RGB)
+        is_unres = d.get("class_id", -1) < 0
+        tag = "⚠️ UNRESOLVED: " if is_unres else ""
+        caption = f"#{d['id']}: {tag}{d['class_name']} (Frame {d['frame_number']}, Track {d['track_id']}, Conf: {d['confidence']:.2f})"
+        if crop_rgb is not None:
+            gallery_items.append((crop_rgb, caption))
+        choices.append(f"#{d['id']} — {tag}{d['class_name']} (Frame {d['frame_number']}, Track {d['track_id']})")
+
+    return prompt_md, dist_md, gallery_items, choices
+
+
+def _get_staged_defect_by_id(staged_id):
+    staged = _ANNOTATION_STATE.get("staged_defects", [])
+    for d in staged:
+        if d["id"] == staged_id:
+            return d
+    return None
+
+
+def _get_staged_id_from_choice_label(label):
+    if not label or not str(label).startswith("#"):
+        return None
+    try:
+        id_str = str(label).split("—")[0].replace("#", "").strip()
+        return int(id_str)
+    except Exception:
+        return None
+
+
+def _get_staged_overlays_for_frame(source_video, frame_number, exclude_id=None):
+    """
+    Find already-staged defect bounding boxes matching BOTH source_video AND frame_number.
+    """
+    staged = _ANNOTATION_STATE.get("staged_defects", [])
+    overlays = []
+    for d in staged:
+        if exclude_id is not None and d.get("id") == exclude_id:
+            continue
+        if d.get("source_video") == source_video and d.get("frame_number") == frame_number:
+            overlays.append({
+                "bbox": [int(v) for v in d["bbox"]],
+                "label": f"#{d['id']} {d['class_name']}"
+            })
+    return overlays
+
+
+def select_staged_defect_for_edit(selected_label):
+    """
+    Loads the chosen staged defect into the editor canvas and controls.
+    """
+    staged_id = _get_staged_id_from_choice_label(selected_label)
+    if staged_id is None:
+        placeholder = render_bbox_editor_html(None, (0, 0, 0, 0), elem_prefix="ds_edit_bbox_")
+        return None, placeholder, gr.Dropdown(), 0, 0, 0, 0, 0, "Select a staged defect above to edit."
+
+    d = _get_staged_defect_by_id(staged_id)
+    if d is None:
+        placeholder = render_bbox_editor_html(None, (0, 0, 0, 0), elem_prefix="ds_edit_bbox_")
+        return None, placeholder, gr.Dropdown(), 0, 0, 0, 0, 0, "Defect not found."
+
+    _ANNOTATION_STATE["editing_staged_id"] = staged_id
+
+    frame_bgr = d.get("original_frame")
+    frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB) if frame_bgr is not None else None
+    x1, y1, x2, y2 = [int(v) for v in d["bbox"]]
+    overlays = _get_staged_overlays_for_frame(d.get("source_video"), d.get("frame_number"), exclude_id=staged_id)
+    html = render_bbox_editor_html(frame_rgb, d["bbox"], canvas_id="edit_bbox_canvas", elem_prefix="ds_edit_bbox_", staged_overlays=overlays)
+
+    crop_rgb = None
+    if d.get("crop_image") is not None and d["crop_image"].size > 0:
+        crop_rgb = cv2.cvtColor(d["crop_image"], cv2.COLOR_BGR2RGB)
+
+    valid_classes = RDD_CLASS_CONFIG.get_class_names() if RDD_CLASS_CONFIG else []
+    dropdown_val = d["class_name"] if d["class_name"] in valid_classes else None
+    if d.get("class_id", -1) < 0 or d["class_name"] not in valid_classes:
+        status_msg = f"⚠️ Editing **Defect #{d['id']}**: UNRESOLVED (`{d['class_name']}`) — Please select a valid class from the dropdown below!"
+    else:
+        status_msg = f"Editing **Defect #{d['id']}**: `{d['class_name']}` (Frame {d['frame_number']}, Track {d['track_id']})"
+    return crop_rgb, html, gr.Dropdown(value=dropdown_val), 0, x1, y1, x2, y2, status_msg
+
+
+def adjust_staged_bbox_padding(padding_px):
+    """
+    Expand/contract the bounding box of the staged defect currently being edited.
+    """
+    staged_id = _ANNOTATION_STATE.get("editing_staged_id")
+    d = _get_staged_defect_by_id(staged_id)
+    if d is None or d.get("original_frame") is None:
+        return None, render_bbox_editor_html(None, (0, 0, 0, 0), elem_prefix="ds_edit_bbox_"), 0, 0, 0, 0
+
+    frame_bgr = d["original_frame"]
+    frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    h, w = frame_bgr.shape[:2]
+    ix1, iy1, ix2, iy2 = d["initial_bbox"]
+    pad = int(padding_px)
+
+    nx1 = max(0, ix1 - pad)
+    ny1 = max(0, iy1 - pad)
+    nx2 = min(w, ix2 + pad)
+    ny2 = min(h, iy2 + pad)
+
+    if nx2 <= nx1 or ny2 <= ny1:
+        return None, render_bbox_editor_html(None, (0, 0, 0, 0), elem_prefix="ds_edit_bbox_"), 0, 0, 0, 0
+
+    d["bbox"] = (nx1, ny1, nx2, ny2)
+    d["crop_image"] = frame_bgr[ny1:ny2, nx1:nx2].copy()
+
+    crop_rgb = cv2.cvtColor(d["crop_image"], cv2.COLOR_BGR2RGB)
+    overlays = _get_staged_overlays_for_frame(d.get("source_video"), d.get("frame_number"), exclude_id=staged_id)
+    html = render_bbox_editor_html(frame_rgb, d["bbox"], canvas_id="edit_bbox_canvas", elem_prefix="ds_edit_bbox_", staged_overlays=overlays)
+    return crop_rgb, html, nx1, ny1, nx2, ny2
+
+
+def apply_staged_bbox_coords(x1, y1, x2, y2):
+    """
+    Apply fine-tuned bounding box coordinates to the staged defect currently being edited.
+    """
+    staged_id = _ANNOTATION_STATE.get("editing_staged_id")
+    d = _get_staged_defect_by_id(staged_id)
+    if d is None or d.get("original_frame") is None:
+        return None, render_bbox_editor_html(None, (0, 0, 0, 0), elem_prefix="ds_edit_bbox_")
+
+    frame_bgr = d["original_frame"]
+    frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    h, w = frame_bgr.shape[:2]
+    nx1 = max(0, int(x1))
+    ny1 = max(0, int(y1))
+    nx2 = min(w, int(x2))
+    ny2 = min(h, int(y2))
+
+    if nx2 <= nx1 or ny2 <= ny1:
+        return None, render_bbox_editor_html(None, (0, 0, 0, 0), elem_prefix="ds_edit_bbox_")
+
+    d["bbox"] = (nx1, ny1, nx2, ny2)
+    d["crop_image"] = frame_bgr[ny1:ny2, nx1:nx2].copy()
+
+    crop_rgb = cv2.cvtColor(d["crop_image"], cv2.COLOR_BGR2RGB)
+    overlays = _get_staged_overlays_for_frame(d.get("source_video"), d.get("frame_number"), exclude_id=staged_id)
+    html = render_bbox_editor_html(frame_rgb, d["bbox"], canvas_id="edit_bbox_canvas", elem_prefix="ds_edit_bbox_", staged_overlays=overlays)
+    return crop_rgb, html
+
+
+def reset_staged_bbox_to_original():
+    """
+    Reset bounding box for the staged defect currently being edited.
+    """
+    staged_id = _ANNOTATION_STATE.get("editing_staged_id")
+    d = _get_staged_defect_by_id(staged_id)
+    if d is None or d.get("original_frame") is None:
+        return None, render_bbox_editor_html(None, (0, 0, 0, 0), elem_prefix="ds_edit_bbox_"), 0, 0, 0, 0, 0
+
+    frame_bgr = d["original_frame"]
+    frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    ix1, iy1, ix2, iy2 = d["initial_bbox"]
+    d["bbox"] = d["initial_bbox"]
+    d["crop_image"] = frame_bgr[iy1:iy2, ix1:ix2].copy()
+
+    crop_rgb = cv2.cvtColor(d["crop_image"], cv2.COLOR_BGR2RGB)
+    overlays = _get_staged_overlays_for_frame(d.get("source_video"), d.get("frame_number"), exclude_id=staged_id)
+    html = render_bbox_editor_html(frame_rgb, d["bbox"], canvas_id="edit_bbox_canvas", elem_prefix="ds_edit_bbox_", staged_overlays=overlays)
+    return crop_rgb, html, ix1, iy1, ix2, iy2, 0
+
+
+def save_staged_defect_changes(chosen_class, bbox=None):
+    """
+    Save class and crop modifications for the currently edited staged defect.
+    Updates the review prompt, distribution breakdown, gallery, and choices.
+    """
+    staged_id = _ANNOTATION_STATE.get("editing_staged_id")
+    d = _get_staged_defect_by_id(staged_id)
+    if d is None:
+        prompt_md, dist_md, gallery_items, choices = get_staged_review_data()
+        return prompt_md, dist_md, gallery_items, gr.Dropdown(choices=choices), "⚠️ No defect selected to save."
+
+    final_bbox = _resolve_bbox(d, explicit_bbox=bbox)
+    d["bbox"] = final_bbox
+
+    if d.get("original_frame") is not None:
+        x1, y1, x2, y2 = final_bbox
+        h, w = d["original_frame"].shape[:2]
+        d["crop_image"] = d["original_frame"][max(0, y1):min(h, y2), max(0, x1):min(w, x2)].copy()
+
+    raw_choice = chosen_class.strip() if chosen_class else ""
+    mapped_choice = RDD_CLASS_CONFIG.map_model_class(raw_choice) if (RDD_CLASS_CONFIG and raw_choice) else raw_choice
+    class_id = RDD_CLASS_CONFIG.get_class_id(mapped_choice) if (RDD_CLASS_CONFIG and mapped_choice) else -1
+    if class_id >= 0 and RDD_CLASS_CONFIG:
+        class_name = RDD_CLASS_CONFIG.get_class_name(class_id)
+    else:
+        # DO NOT DEFAULT TO POTHOLE! Keep class_id = -1 and raw unresolved string
+        class_id = -1
+        class_name = raw_choice.upper() if raw_choice else (d.get("class_name") or "UNRESOLVED")
+
+    d["class_name"] = class_name
+    d["class_id"] = class_id
+
+    prompt_md, dist_md, gallery_items, choices = get_staged_review_data()
+    cur_label = next((c for c in choices if c.startswith(f"#{d['id']} ")), choices[0] if choices else None)
+    if class_id < 0:
+        return prompt_md, dist_md, gallery_items, gr.Dropdown(choices=choices, value=cur_label), f"⚠️ Saved changes for Defect #{d['id']}, but class `{d['class_name']}` is still UNRESOLVED! Please select a valid class from the dropdown."
+    return prompt_md, dist_md, gallery_items, gr.Dropdown(choices=choices, value=cur_label), f"✅ Saved changes for Defect #{d['id']} (`{d['class_name']}`)!"
+
+
+def delete_staged_defect():
+    """
+    Remove the currently edited defect from the staged batch.
+    """
+    staged_id = _ANNOTATION_STATE.get("editing_staged_id")
+    staged = _ANNOTATION_STATE.get("staged_defects", [])
+    _ANNOTATION_STATE["staged_defects"] = [d for d in staged if d["id"] != staged_id]
+    _ANNOTATION_STATE["editing_staged_id"] = None
+    _ANNOTATION_STATE["accepted_count"] = len(_ANNOTATION_STATE["staged_defects"])
+
+    prompt_md, dist_md, gallery_items, choices = get_staged_review_data()
+    placeholder_html = render_bbox_editor_html(None, (0, 0, 0, 0), elem_prefix="ds_edit_bbox_")
+    new_val = choices[0] if choices else None
+    return (
+        prompt_md, dist_md, gallery_items, gr.Dropdown(choices=choices, value=new_val),
+        None, placeholder_html, gr.Dropdown(value=None), 0, 0, 0, 0, 0,
+        f"🗑️ Removed Defect #{staged_id} from batch."
+    )
+
+
+def commit_staged_defects_to_dataset():
+    """
+    Permanently commit all staged defects into the RDD_Ahmedabad dataset.
+    This writes original frames, labels, crops, data.yaml, and metadata.
+    """
+    staged = _ANNOTATION_STATE.get("staged_defects", [])
+    if not staged:
+        return "⚠️ No staged defects to save. Please review candidates and accept defects first.", get_dataset_stats_md(), gr.update(visible=True)
+
+    if not RDD_CLASS_CONFIG or not RDD_DATASET_MANAGER or not RDD_ANNOTATION_MANAGER:
+        return "❌ Dataset manager system not initialized.", get_dataset_stats_md(), gr.update(visible=True)
+
+    saved_count = 0
+    class_saved_counts = collections.Counter()
+    split_saved_counts = collections.Counter()
+    skipped_unresolved = []
+
+    valid_classes = set(RDD_CLASS_CONFIG.get_class_names())
+
+    for d in staged:
+        cid = d.get("class_id", -1)
+        cname = d.get("class_name", "")
+
+        # Guard: skip defects with class_id == -1 or unmapped class name
+        if cid < 0 or cname not in valid_classes:
+            skipped_unresolved.append(f"Defect #{d.get('id', '?')} (`{cname}`)")
+            continue
+
+        try:
+            saved = RDD_DATASET_MANAGER.add_annotation(
+                frame=d["original_frame"],
+                bbox=d["bbox"],
+                class_id=d["class_id"],
+                class_name=d["class_name"],
+                source_video=d["source_video"],
+                frame_number=d["frame_number"],
+                track_id=d["track_id"],
+                confidence=d["confidence"],
+                crop_image=d["crop_image"],
+            )
+            x1, y1, x2, y2 = d["bbox"]
+            RDD_ANNOTATION_MANAGER.add_record(
+                image_name=saved.get("image_filename", ""),
+                crop_name=saved.get("crop_filename", ""),
+                class_id=d["class_id"],
+                class_name=d["class_name"],
+                confidence=d["confidence"],
+                source_video=d["source_video"],
+                frame_number=d["frame_number"],
+                track_id=d["track_id"],
+                bbox_x=x1,
+                bbox_y=y1,
+                bbox_width=x2 - x1,
+                bbox_height=y2 - y1,
+                split=saved.get("split", "train"),
+            )
+            saved_count += 1
+            class_saved_counts[d["class_name"]] += 1
+            split_saved_counts[saved.get("split", "train")] += 1
+        except Exception as e:
+            print(f"[Dataset Commit Error] Failed to save defect #{d['id']}: {e}")
+
+    # Auto-update data.yaml if any defects were saved
+    if saved_count > 0:
+        try:
+            RDD_DATASET_MANAGER.update_data_yaml()
+        except Exception as e:
+            print(f"[Dataset Commit Error] update_data_yaml failed: {e}")
+
+    # Clear staged defects and candidates
+    _ANNOTATION_STATE["staged_defects"] = []
+    _ANNOTATION_STATE["editing_staged_id"] = None
+    _ANNOTATION_STATE["candidates"] = []
+
+    # Get updated dataset statistics
+    stats_md = get_dataset_stats_md()
+
+    skipped_md = ""
+    if skipped_unresolved:
+        skipped_md = f"""
+> [!WARNING]
+> ⚠️ **{len(skipped_unresolved)} Staged Defect(s) Skipped (Unresolved Class):**  
+> {', '.join(skipped_unresolved)}  
+> These defects were not saved to disk because no valid RDD_Ahmedabad class was assigned.
+"""
+
+    if saved_count == 0:
+        fail_md = f"""### ⚠️ No Defects Added to RDD_Ahmedabad Dataset
+
+{skipped_md}
+
+All staged defect(s) were skipped because they had unresolved classes. Please load detections again, assign valid classes, and commit.
+"""
+        return fail_md, stats_md, gr.update(visible=False)
+
+    class_breakdown = "\n".join([f"- **{c}**: `{cnt}` crops" for c, cnt in sorted(class_saved_counts.items())])
+    split_breakdown = ", ".join([f"**{sp}**: {cnt}" for sp, cnt in sorted(split_saved_counts.items())])
+
+    success_md = f"""### 🎉 Successfully Added {saved_count} Defects to RDD_Ahmedabad Dataset!
+{skipped_md}
+All annotations, original frames, crop images, and YOLO labels have been confirmed and permanently saved.
+
+| Metric | Detail |
+|---|---|
+| **Defects Committed** | **{saved_count}** |
+| **Splits Assigned** | {split_breakdown} |
+
+#### Saved Defect Breakdown:
+{class_breakdown}
+
+---
+💾 Stored in `datasets/RDD_Ahmedabad/` (`images/`, `labels/`, `crops/`, `metadata/`).
+"""
+    return success_md, stats_md, gr.update(visible=False)
+
+
+def discard_staged_batch():
+    """Discard all staged defects without saving to dataset."""
+    count = len(_ANNOTATION_STATE.get("staged_defects", []))
+    _ANNOTATION_STATE["staged_defects"] = []
+    _ANNOTATION_STATE["editing_staged_id"] = None
+    _ANNOTATION_STATE["candidates"] = []
+    _ANNOTATION_STATE["current_index"] = 0
+    _ANNOTATION_STATE["skipped_count"] = 0
+    return f"🗑️ Discarded {count} staged defects. No changes were made to the RDD_Ahmedabad dataset."
+
+
 def get_dataset_stats_md():
     """Return dataset statistics as markdown."""
     if RDD_DATASET_MANAGER:
         return RDD_DATASET_MANAGER.get_stats_markdown()
     return "Dataset system not initialized."
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# RDD_Ahmedabad Dataset Curation & Revival — State & Handlers
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_CURATE_STATE = {
+    "df": None,
+    "current_pos": 0,
+    "current_row": None,
+    "current_frame_bgr": None,
+    "current_frame_rgb": None,
+    "current_bbox": (0, 0, 0, 0),
+    "initial_bbox": (0, 0, 0, 0),
+    "active_image_name": "",
+    "active_split": "train",
+    "active_class_name": "",
+    "class_filter": "ALL",
+    "split_filter": "ALL",
+    "search_term": "",
+    "status_msg": "",
+}
+
+
+def get_curate_class_choices():
+    """Return dropdown choices for the class filter with counts from annotations.csv."""
+    default_choices = [("ALL (All Classes)", "ALL")]
+    if not RDD_ANNOTATION_MANAGER:
+        return default_choices
+    try:
+        df = RDD_ANNOTATION_MANAGER.load_annotations()
+        if df.empty or "class_name" not in df.columns:
+            return default_choices
+        counts = df["class_name"].value_counts()
+        choices = [("ALL (All Classes)", "ALL")]
+        for cname, cnt in counts.items():
+            choices.append((f"{cname} ({cnt})", str(cname)))
+        return choices
+    except Exception:
+        return default_choices
+
+
+def load_curate_dataset(class_filter="ALL", split_filter="ALL", search_term=""):
+    """
+    Load annotations from annotations.csv and filter by class, split, and search keyword.
+    Updates _CURATE_STATE and returns dropdown choices for jump selector.
+    """
+    if not RDD_ANNOTATION_MANAGER:
+        _CURATE_STATE["df"] = pd.DataFrame()
+        _CURATE_STATE["current_pos"] = 0
+        return []
+
+    df = RDD_ANNOTATION_MANAGER.load_annotations()
+    if df.empty:
+        _CURATE_STATE["df"] = df
+        _CURATE_STATE["current_pos"] = 0
+        return []
+
+    if class_filter and class_filter != "ALL":
+        df = df[df["class_name"] == class_filter]
+
+    if split_filter and split_filter != "ALL":
+        df = df[df["split"] == split_filter]
+
+    if search_term and search_term.strip():
+        term = search_term.strip().lower()
+        mask = (
+            df["image_name"].astype(str).str.lower().str.contains(term, na=False) |
+            df["source_video"].astype(str).str.lower().str.contains(term, na=False) |
+            df["class_name"].astype(str).str.lower().str.contains(term, na=False)
+        )
+        df = df[mask]
+
+    df = df.reset_index(drop=True)
+    _CURATE_STATE["df"] = df
+    _CURATE_STATE["current_pos"] = 0
+    _CURATE_STATE["class_filter"] = class_filter
+    _CURATE_STATE["split_filter"] = split_filter
+    _CURATE_STATE["search_term"] = search_term
+
+    choices = []
+    for i, r in df.iterrows():
+        cname = r.get("class_name", "")
+        img_name = str(r.get("image_name", ""))
+        short_img = img_name[:24] + "..." if len(img_name) > 24 else img_name
+        split = r.get("split", "")
+        label = f"#{i+1}: [{cname}] {short_img} ({split})"
+        choices.append((label, i))
+    return choices
+
+
+def get_curate_defect_display(pos=None):
+    """
+    Load and return UI display elements for the defect at position pos in the filtered dataset.
+    Returns:
+    (crop_rgb, canvas_html, info_md, chosen_class, x1, y1, x2, y2, padding, pos_badge, jump_val, status_md)
+    """
+    df = _CURATE_STATE.get("df")
+    if df is None:
+        load_curate_dataset()
+        df = _CURATE_STATE.get("df")
+
+    placeholder_html = render_bbox_editor_html(None, (0, 0, 0, 0), canvas_id="curate_canvas", elem_prefix="ds_curate_bbox_")
+    rdd_classes = RDD_CLASS_CONFIG.get_class_names() if RDD_CLASS_CONFIG else ["POTHOLE"]
+    default_class = rdd_classes[0] if rdd_classes else "POTHOLE"
+
+    if df is None or df.empty:
+        empty_info = """
+<div class="ds-candidate-card" style="padding:20px;text-align:center;color:#94a3b8;">
+  No defect records matched the current filter/search criteria.
+</div>
+"""
+        return None, placeholder_html, empty_info, default_class, 0, 0, 0, 0, 0, "No defects available", None, ""
+
+    if pos is not None:
+        try:
+            pos = int(pos)
+        except (ValueError, TypeError):
+            pos = 0
+    else:
+        pos = _CURATE_STATE.get("current_pos", 0)
+
+    pos = max(0, min(len(df) - 1, pos))
+    _CURATE_STATE["current_pos"] = pos
+
+    row = df.iloc[pos]
+    _CURATE_STATE["current_row"] = row.to_dict()
+
+    image_name = str(row.get("image_name", ""))
+    split = str(row.get("split", "train"))
+    class_name = str(row.get("class_name", default_class))
+    crop_name = str(row.get("crop_name", f"{os.path.splitext(image_name)[0]}_crop.jpg"))
+
+    try:
+        x = int(row.get("bbox_x", 0))
+        y = int(row.get("bbox_y", 0))
+        w = int(row.get("bbox_width", 0))
+        h = int(row.get("bbox_height", 0))
+    except (ValueError, TypeError):
+        x, y, w, h = 0, 0, 100, 100
+
+    bbox = (x, y, x + w, y + h)
+    _CURATE_STATE["current_bbox"] = bbox
+    _CURATE_STATE["initial_bbox"] = bbox
+    _CURATE_STATE["active_image_name"] = image_name
+    _CURATE_STATE["active_split"] = split
+    _CURATE_STATE["active_class_name"] = class_name
+
+    # Load original frame
+    image_path = os.path.join(DATASET_DIR, "images", split, image_name)
+    frame_bgr = None
+    if os.path.exists(image_path):
+        frame_bgr = cv2.imread(image_path)
+        if frame_bgr is None:
+            try:
+                with open(image_path, "rb") as f:
+                    buf = np.frombuffer(f.read(), dtype=np.uint8)
+                    frame_bgr = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+            except Exception:
+                pass
+
+    crop_rgb = None
+    canvas_html = placeholder_html
+
+    if frame_bgr is not None and frame_bgr.size > 0:
+        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        _CURATE_STATE["current_frame_bgr"] = frame_bgr
+        _CURATE_STATE["current_frame_rgb"] = frame_rgb
+
+        img_h, img_w = frame_bgr.shape[:2]
+        cx1 = max(0, min(img_w, x))
+        cy1 = max(0, min(img_h, y))
+        cx2 = max(0, min(img_w, x + w))
+        cy2 = max(0, min(img_h, y + h))
+
+        if cx2 > cx1 and cy2 > cy1:
+            crop_bgr = frame_bgr[cy1:cy2, cx1:cx2].copy()
+            crop_rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
+
+        canvas_html = render_bbox_editor_html(
+            frame_rgb,
+            bbox,
+            canvas_id="curate_canvas",
+            elem_prefix="ds_curate_bbox_"
+        )
+    else:
+        # Fallback to existing saved crop if original frame is missing
+        crop_path = os.path.join(DATASET_DIR, "crops", class_name, crop_name)
+        if os.path.exists(crop_path):
+            existing_crop = cv2.imread(crop_path)
+            if existing_crop is not None and existing_crop.size > 0:
+                crop_rgb = cv2.cvtColor(existing_crop, cv2.COLOR_BGR2RGB)
+
+    conf_val = row.get("confidence")
+    conf_str = f"{float(conf_val):.1%}" if pd.notnull(conf_val) and str(conf_val).strip() != "" else "N/A"
+    frame_num = str(row.get("frame_number", "N/A"))
+    track_id = str(row.get("track_id", "N/A"))
+    source_video = str(row.get("source_video", "N/A"))
+
+    info_md = f"""
+<div class="ds-candidate-card" style="border-left: 3px solid #a855f7;">
+  <div class="ds-card-row">
+    <span style="font-weight:700;color:#f1f5f9;font-size:0.92rem;">Defect #{pos + 1} of {len(df)}</span>
+    <span class="pill pill-active" style="padding:2px 8px;font-size:0.75rem;">{split.upper()}</span>
+  </div>
+  <div class="ds-meta-grid" style="margin-top:6px;">
+    <div class="ds-meta-item"><span class="ds-meta-lbl">Class:</span> <span class="ds-meta-val"><code style="color:#c084fc;font-weight:700;">{class_name}</code></span></div>
+    <div class="ds-meta-item"><span class="ds-meta-lbl">Confidence:</span> <span class="ds-meta-val">{conf_str}</span></div>
+    <div class="ds-meta-item"><span class="ds-meta-lbl">Source Video:</span> <span class="ds-meta-val" title="{source_video}"><code>{source_video[:22]}</code></span></div>
+    <div class="ds-meta-item"><span class="ds-meta-lbl">Dimensions:</span> <span class="ds-meta-val"><code>{w}x{h} px</code></span></div>
+  </div>
+  <details class="ds-details-accordion" style="margin-top:6px;">
+    <summary>📋 Provenance & File Names</summary>
+    <div class="ds-details-content">
+      <div style="grid-column: span 2;"><b>Image:</b> <code>{image_name}</code></div>
+      <div><b>Frame:</b> <code>{frame_num}</code></div>
+      <div><b>Track:</b> <code>{track_id}</code></div>
+      <div style="grid-column: span 2;"><b>Coordinates:</b> <code>[{x}, {y}, {x+w}, {y+h}]</code></div>
+    </div>
+  </details>
+</div>
+"""
+    pos_badge = f"📍 Defect **{pos + 1}** of **{len(df)}** · Filtered Total: **{len(df)}**"
+    status_md = _CURATE_STATE.get("status_msg", "")
+    _CURATE_STATE["status_msg"] = ""
+
+    return (
+        crop_rgb, canvas_html, info_md, class_name,
+        x, y, x + w, y + h, 0, pos_badge, pos, status_md
+    )
+
+
+def curate_adjust_padding(padding_px):
+    """Expand/shrink the current defect bbox on the canvas by padding_px pixels."""
+    frame_bgr = _CURATE_STATE.get("current_frame_bgr")
+    frame_rgb = _CURATE_STATE.get("current_frame_rgb")
+    if frame_bgr is None or frame_rgb is None:
+        return None, render_bbox_editor_html(None, (0, 0, 0, 0)), 0, 0, 0, 0
+
+    h, w = frame_bgr.shape[:2]
+    ix1, iy1, ix2, iy2 = _CURATE_STATE.get("initial_bbox", (0, 0, 0, 0))
+    pad = int(padding_px)
+
+    nx1 = max(0, ix1 - pad)
+    ny1 = max(0, iy1 - pad)
+    nx2 = min(w, ix2 + pad)
+    ny2 = min(h, iy2 + pad)
+
+    if nx2 <= nx1 or ny2 <= ny1:
+        return None, render_bbox_editor_html(frame_rgb, (ix1, iy1, ix2, iy2), canvas_id="curate_canvas", elem_prefix="ds_curate_bbox_"), ix1, iy1, ix2, iy2
+
+    new_bbox = (nx1, ny1, nx2, ny2)
+    _CURATE_STATE["current_bbox"] = new_bbox
+
+    crop_bgr = frame_bgr[ny1:ny2, nx1:nx2].copy()
+    crop_rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB) if crop_bgr.size > 0 else None
+    canvas_html = render_bbox_editor_html(frame_rgb, new_bbox, canvas_id="curate_canvas", elem_prefix="ds_curate_bbox_")
+    return crop_rgb, canvas_html, nx1, ny1, nx2, ny2
+
+
+def curate_apply_coords(x1, y1, x2, y2):
+    """Apply manual or canvas-dragged coordinates to live defect crop and canvas."""
+    frame_bgr = _CURATE_STATE.get("current_frame_bgr")
+    frame_rgb = _CURATE_STATE.get("current_frame_rgb")
+    if frame_bgr is None or frame_rgb is None:
+        return None, render_bbox_editor_html(None, (0, 0, 0, 0))
+
+    h, w = frame_bgr.shape[:2]
+    try:
+        nx1 = max(0, min(w, int(x1)))
+        ny1 = max(0, min(h, int(y1)))
+        nx2 = max(0, min(w, int(x2)))
+        ny2 = max(0, min(h, int(y2)))
+    except (ValueError, TypeError):
+        return None, render_bbox_editor_html(frame_rgb, (0, 0, 0, 0), canvas_id="curate_canvas", elem_prefix="ds_curate_bbox_")
+
+    if nx2 <= nx1 or ny2 <= ny1:
+        return None, render_bbox_editor_html(frame_rgb, _CURATE_STATE.get("current_bbox", (0, 0, 0, 0)), canvas_id="curate_canvas", elem_prefix="ds_curate_bbox_")
+
+    new_bbox = (nx1, ny1, nx2, ny2)
+    _CURATE_STATE["current_bbox"] = new_bbox
+
+    crop_bgr = frame_bgr[ny1:ny2, nx1:nx2].copy()
+    crop_rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB) if crop_bgr.size > 0 else None
+    canvas_html = render_bbox_editor_html(frame_rgb, new_bbox, canvas_id="curate_canvas", elem_prefix="ds_curate_bbox_")
+    return crop_rgb, canvas_html
+
+
+def curate_reset_bbox():
+    """Reset curate bbox to initial saved coordinates."""
+    ibbox = _CURATE_STATE.get("initial_bbox", (0, 0, 0, 0))
+    _CURATE_STATE["current_bbox"] = ibbox
+    x1, y1, x2, y2 = ibbox
+    frame_bgr = _CURATE_STATE.get("current_frame_bgr")
+    frame_rgb = _CURATE_STATE.get("current_frame_rgb")
+    if frame_bgr is None or frame_rgb is None:
+        return None, render_bbox_editor_html(None, (0, 0, 0, 0)), x1, y1, x2, y2, 0
+
+    crop_bgr = frame_bgr[y1:y2, x1:x2].copy() if y2 > y1 and x2 > x1 else None
+    crop_rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB) if crop_bgr is not None and crop_bgr.size > 0 else None
+    canvas_html = render_bbox_editor_html(frame_rgb, ibbox, canvas_id="curate_canvas", elem_prefix="ds_curate_bbox_")
+    return crop_rgb, canvas_html, x1, y1, x2, y2, 0
+
+
+def curate_save_changes(chosen_class, x1, y1, x2, y2):
+    """
+    Save modifications for the active defect: updates crop file, YOLO label,
+    annotations.csv, and dataset stats.
+    """
+    row = _CURATE_STATE.get("current_row")
+    if not row or not RDD_DATASET_MANAGER or not RDD_ANNOTATION_MANAGER:
+        return (
+            None, render_bbox_editor_html(None, (0, 0, 0, 0)), "",
+            chosen_class, 0, 0, 0, 0, 0, "", None,
+            "❌ Dataset manager not initialized.",
+            get_dataset_stats_md()
+        )
+
+    image_name = row.get("image_name")
+    split = row.get("split", "train")
+    old_class_name = row.get("class_name", "")
+    crop_name = row.get("crop_name", f"{os.path.splitext(image_name)[0]}_crop.jpg")
+
+    new_class_name = chosen_class.strip() if chosen_class else old_class_name
+    new_class_id = RDD_CLASS_CONFIG.get_class_id(new_class_name) if RDD_CLASS_CONFIG else 0
+
+    try:
+        x1 = max(0, int(x1))
+        y1 = max(0, int(y1))
+        x2 = max(0, int(x2))
+        y2 = max(0, int(y2))
+    except (ValueError, TypeError):
+        x1, y1, x2, y2 = _CURATE_STATE.get("current_bbox", (0, 0, 100, 100))
+
+    new_bbox = (x1, y1, x2, y2)
+    bbox_w = x2 - x1
+    bbox_h = y2 - y1
+
+    # Extract crop from current frame
+    frame_bgr = _CURATE_STATE.get("current_frame_bgr")
+    new_crop_bgr = None
+    if frame_bgr is not None and frame_bgr.size > 0 and bbox_h > 0 and bbox_w > 0:
+        new_crop_bgr = frame_bgr[y1:y2, x1:x2].copy()
+
+    # 1. Update on disk (crop + YOLO txt)
+    try:
+        RDD_DATASET_MANAGER.update_defect(
+            image_name=image_name,
+            split=split,
+            old_class_name=old_class_name,
+            new_class_id=new_class_id,
+            new_class_name=new_class_name,
+            bbox=new_bbox,
+            crop_image=new_crop_bgr,
+            crop_name=crop_name
+        )
+    except Exception as e:
+        print(f"[Curate Error] update_defect failed: {e}")
+
+    # 2. Update in annotations.csv
+    try:
+        RDD_ANNOTATION_MANAGER.update_record(
+            image_name=image_name,
+            class_id=new_class_id,
+            class_name=new_class_name,
+            bbox_x=x1,
+            bbox_y=y1,
+            bbox_width=bbox_w,
+            bbox_height=bbox_h
+        )
+    except Exception as e:
+        print(f"[Curate Error] update_record failed: {e}")
+
+    # 3. Update in-memory state
+    pos = _CURATE_STATE.get("current_pos", 0)
+    df = _CURATE_STATE.get("df")
+    if df is not None and pos < len(df):
+        df.loc[pos, "class_name"] = new_class_name
+        df.loc[pos, "class_id"] = new_class_id
+        df.loc[pos, "bbox_x"] = x1
+        df.loc[pos, "bbox_y"] = y1
+        df.loc[pos, "bbox_width"] = bbox_w
+        df.loc[pos, "bbox_height"] = bbox_h
+        _CURATE_STATE["df"] = df
+
+    _CURATE_STATE["initial_bbox"] = new_bbox
+    _CURATE_STATE["current_bbox"] = new_bbox
+    _CURATE_STATE["active_class_name"] = new_class_name
+    _CURATE_STATE["status_msg"] = f"✅ **Saved Defect #{pos + 1}!** Updated class: `{new_class_name}`, Crop: `{crop_name}`, Box: `[{x1}, {y1}, {x2}, {y2}]` ({bbox_w}x{bbox_h}px)."
+
+    disp = get_curate_defect_display(pos)
+    stats_md = get_dataset_stats_md()
+    return (*disp, stats_md)
+
+
+def curate_delete_defect():
+    """
+    Permanently delete the current defect from RDD_Ahmedabad dataset
+    (removes crop, YOLO label, frame image, and metadata record).
+    """
+    row = _CURATE_STATE.get("current_row")
+    if not row or not RDD_DATASET_MANAGER or not RDD_ANNOTATION_MANAGER:
+        return (
+            None, render_bbox_editor_html(None, (0, 0, 0, 0)), "",
+            "POTHOLE", 0, 0, 0, 0, 0, "", None,
+            "❌ Dataset manager not initialized.",
+            get_dataset_stats_md()
+        )
+
+    image_name = row.get("image_name")
+    split = row.get("split", "train")
+    class_name = row.get("class_name", "")
+    crop_name = row.get("crop_name", f"{os.path.splitext(image_name)[0]}_crop.jpg")
+    pos = _CURATE_STATE.get("current_pos", 0)
+
+    # 1. Delete from disk
+    try:
+        RDD_DATASET_MANAGER.delete_defect(
+            image_name=image_name,
+            split=split,
+            class_name=class_name,
+            crop_name=crop_name
+        )
+    except Exception as e:
+        print(f"[Curate Delete Error] delete_defect failed: {e}")
+
+    # 2. Delete from metadata
+    try:
+        RDD_ANNOTATION_MANAGER.delete_record(image_name=image_name)
+    except Exception as e:
+        print(f"[Curate Delete Error] delete_record failed: {e}")
+
+    # 3. Update in-memory dataframe
+    df = _CURATE_STATE.get("df")
+    if df is not None and not df.empty and pos < len(df):
+        df = df.drop(index=pos).reset_index(drop=True)
+        _CURATE_STATE["df"] = df
+        if pos >= len(df):
+            pos = max(0, len(df) - 1)
+        _CURATE_STATE["current_pos"] = pos
+
+    _CURATE_STATE["status_msg"] = f"🗑️ **Deleted Defect!** Removed `{image_name}` from `{split}` split and deleted crop `{crop_name}`."
+    disp = get_curate_defect_display(pos)
+    stats_md = get_dataset_stats_md()
+    return (*disp, stats_md)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1185,24 +2720,26 @@ def _encode_frame_base64(frame_rgb):
     return base64.b64encode(buffer).decode('utf-8')
 
 
-def render_bbox_editor_html(frame_rgb, bbox, canvas_id="bbox_canvas"):
+def render_bbox_editor_html(frame_rgb, bbox, canvas_id="bbox_canvas", elem_prefix="ds_bbox_", staged_overlays=None):
     """
-    Render an interactive HTML5 canvas with draggable bounding box corners.
-    The user can drag corner handles, edge midpoints, or move the entire box.
-    On release, the JS auto-updates the Gradio X1/Y1/X2/Y2 Number inputs.
+    Render an interactive HTML5 canvas with draggable/resizable bounding box.
+    Supports:
+    - Drag corner handles or edge midpoints to resize
+    - Drag inside box to move
+    - Click and drag outside box (min 10px drag guard) to draw a brand-new bounding box
+    - Overlay already-staged defects in the same frame as read-only dashed boxes with tags
+    - Single DOM input sync mechanism (inp.value set + input/change dispatch)
     """
     if frame_rgb is None:
-        return '<div style="text-align:center;color:#94a3b8;padding:40px;font-family:Inter,sans-serif;">No frame loaded. Click ✏️ Adjust Crop to load the source frame.</div>'
+        return '<div style="text-align:center;color:#94a3b8;padding:40px;font-family:Inter,sans-serif;">No frame loaded. Click 📥 Load Detections to begin.</div>'
 
     b64_str = _encode_frame_base64(frame_rgb)
     if b64_str is None:
         return '<div style="text-align:center;color:#94a3b8;padding:40px;">Failed to encode frame.</div>'
 
     x1, y1, x2, y2 = [int(v) for v in bbox]
+    staged_json = json.dumps(staged_overlays if staged_overlays else [])
 
-    # Build the inner HTML document for the iframe srcdoc.
-    # Gradio 5+/6+ sanitizes <script> tags in gr.HTML, so we must use an
-    # <iframe srcdoc> to get JavaScript execution for the interactive canvas.
     inner_html = f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8">
 <style>
@@ -1212,7 +2749,7 @@ def render_bbox_editor_html(frame_rgb, bbox, canvas_id="bbox_canvas"):
 </style>
 </head><body>
 <canvas id="cv"></canvas>
-<div class="hint">🟠 Drag corners to resize &nbsp;·&nbsp; Drag inside box to move &nbsp;·&nbsp; Click 📐 Apply to update crop</div>
+<div class="hint">🔷 Drag corners/edges to resize &nbsp;·&nbsp; Drag inside box to move &nbsp;·&nbsp; Click &amp; drag outside (min 10px) to draw new box</div>
 <script>
 (function() {{
   const C = document.getElementById('cv');
@@ -1222,7 +2759,11 @@ def render_bbox_editor_html(frame_rgb, bbox, canvas_id="bbox_canvas"):
   img.src = 'data:image/jpeg;base64,{b64_str}';
 
   let box = {{ x1:{x1}, y1:{y1}, x2:{x2}, y2:{y2} }};
+  let origBox = {{ x1:{x1}, y1:{y1}, x2:{x2}, y2:{y2} }};
+  const staged = {staged_json};
   let drag = null;
+  let isPotentialDraw = false;
+  let drawStart = {{ x:0, y:0 }};
   let ds = {{ x:0, y:0 }};
   let sc = 1;
 
@@ -1245,122 +2786,224 @@ def render_bbox_editor_html(frame_rgb, bbox, canvas_id="bbox_canvas"):
   function paint() {{
     ctx.clearRect(0,0,C.width,C.height);
     ctx.drawImage(img,0,0,C.width,C.height);
-    const sx1=box.x1*sc, sy1=box.y1*sc, sx2=box.x2*sc, sy2=box.y2*sc;
-    const bw=sx2-sx1, bh=sy2-sy1;
 
-    // Dim area outside box
-    ctx.fillStyle='rgba(0,0,0,0.45)';
-    ctx.fillRect(0,0,C.width,sy1);
-    ctx.fillRect(0,sy2,C.width,C.height-sy2);
-    ctx.fillRect(0,sy1,sx1,bh);
-    ctx.fillRect(sx2,sy1,C.width-sx2,bh);
+    // 1. Render already-staged defects in this frame as read-only dashed overlay boxes with labels
+    if (Array.isArray(staged)) {{
+      staged.forEach(function(item) {{
+        if (!item || !item.bbox) return;
+        const ox1 = item.bbox[0] * sc, oy1 = item.bbox[1] * sc;
+        const ox2 = item.bbox[2] * sc, oy2 = item.bbox[3] * sc;
+        const obw = ox2 - ox1, obh = oy2 - oy1;
+        ctx.save();
+        ctx.setLineDash([5, 4]);
+        ctx.strokeStyle = '#38bdf8';
+        ctx.lineWidth = 2;
+        ctx.strokeRect(ox1, oy1, obw, obh);
+        ctx.fillStyle = 'rgba(56, 189, 248, 0.12)';
+        ctx.fillRect(ox1, oy1, obw, obh);
+        const tag = item.label || 'Staged Defect';
+        ctx.font = 'bold 10px monospace';
+        const tagW = ctx.measureText(tag).width + 8;
+        ctx.fillStyle = 'rgba(2, 132, 199, 0.9)';
+        ctx.fillRect(ox1, Math.max(0, oy1 - 16), Math.max(tagW, 60), 16);
+        ctx.fillStyle = '#ffffff';
+        ctx.fillText(tag, ox1 + 4, Math.max(11, oy1 - 4));
+        ctx.restore();
+      }});
+    }}
 
-    // Box border
-    ctx.strokeStyle='#22c55e'; ctx.lineWidth=2;
-    ctx.strokeRect(sx1,sy1,bw,bh);
+    // 2. Dim area outside active box
+    const sx1 = box.x1 * sc, sy1 = box.y1 * sc, sx2 = box.x2 * sc, sy2 = box.y2 * sc;
+    const bw = sx2 - sx1, bh = sy2 - sy1;
 
-    // Corner handles
-    const hs=10;
-    ctx.fillStyle='#f97316';
-    [[sx1,sy1],[sx2,sy1],[sx1,sy2],[sx2,sy2]].forEach(function(p){{
-      ctx.fillRect(p[0]-hs/2,p[1]-hs/2,hs,hs);
+    ctx.fillStyle = 'rgba(0,0,0,0.42)';
+    ctx.fillRect(0, 0, C.width, sy1);
+    ctx.fillRect(0, sy2, C.width, C.height - sy2);
+    ctx.fillRect(0, sy1, sx1, bh);
+    ctx.fillRect(sx2, sy1, C.width - sx2, bh);
+
+    // 3. Active box border
+    ctx.strokeStyle = '#22c55e';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(sx1, sy1, bw, bh);
+
+    // 4. Corner handles
+    const hs = 10;
+    ctx.fillStyle = '#38bdf8';
+    [[sx1, sy1], [sx2, sy1], [sx1, sy2], [sx2, sy2]].forEach(function(p) {{
+      ctx.fillRect(p[0] - hs / 2, p[1] - hs / 2, hs, hs);
     }});
 
-    // Edge midpoint handles
-    ctx.fillStyle='#38bdf8';
-    const emid=7;
-    [[sx1+bw/2,sy1],[sx1+bw/2,sy2],[sx1,sy1+bh/2],[sx2,sy1+bh/2]].forEach(function(p){{
-      ctx.beginPath(); ctx.arc(p[0],p[1],emid/2,0,Math.PI*2); ctx.fill();
+    // 5. Edge midpoint handles
+    ctx.fillStyle = '#0284c7';
+    const emid = 7;
+    [[sx1 + bw / 2, sy1], [sx1 + bw / 2, sy2], [sx1, sy1 + bh / 2], [sx2, sy1 + bh / 2]].forEach(function(p) {{
+      ctx.beginPath();
+      ctx.arc(p[0], p[1], emid / 2, 0, Math.PI * 2);
+      ctx.fill();
     }});
 
-    // Coordinate label
-    ctx.fillStyle='#22c55e'; ctx.font='bold 11px monospace';
-    ctx.fillText('('+Math.round(box.x1)+','+Math.round(box.y1)+') - ('+Math.round(box.x2)+','+Math.round(box.y2)+')', sx1, Math.max(sy1-6,13));
+    // 6. Coordinate label
+    ctx.fillStyle = '#22c55e';
+    ctx.font = 'bold 11px monospace';
+    ctx.fillText('(' + Math.round(box.x1) + ',' + Math.round(box.y1) + ') - (' + Math.round(box.x2) + ',' + Math.round(box.y2) + ')', sx1, Math.max(sy1 - 6, 13));
 
-    // Size label
-    const ww=Math.round(box.x2-box.x1), hh=Math.round(box.y2-box.y1);
-    ctx.fillStyle='rgba(0,0,0,0.7)'; ctx.fillRect(sx1,sy2+4,90,18); ctx.fillStyle='#f1f5f9'; ctx.font='11px monospace';
-    ctx.fillText(ww+'x'+hh+'px', sx1+4, sy2+16);
+    // 7. Size label
+    const ww = Math.round(box.x2 - box.x1), hh = Math.round(box.y2 - box.y1);
+    ctx.fillStyle = 'rgba(0,0,0,0.75)';
+    ctx.fillRect(sx1, sy2 + 4, 90, 18);
+    ctx.fillStyle = '#f1f5f9';
+    ctx.font = '11px monospace';
+    ctx.fillText(ww + 'x' + hh + 'px', sx1 + 4, sy2 + 16);
   }}
 
   function mpos(e) {{
-    const r=C.getBoundingClientRect();
-    return {{ x:e.clientX-r.left, y:e.clientY-r.top }};
+    const r = C.getBoundingClientRect();
+    return {{ x: e.clientX - r.left, y: e.clientY - r.top }};
   }}
 
   function hit(p) {{
-    const g=14;
-    const sx1=box.x1*sc, sy1=box.y1*sc, sx2=box.x2*sc, sy2=box.y2*sc;
-    const mx=(sx1+sx2)/2, my=(sy1+sy2)/2;
-    if(Math.abs(p.x-sx1)<g && Math.abs(p.y-sy1)<g) return 'tl';
-    if(Math.abs(p.x-sx2)<g && Math.abs(p.y-sy1)<g) return 'tr';
-    if(Math.abs(p.x-sx1)<g && Math.abs(p.y-sy2)<g) return 'bl';
-    if(Math.abs(p.x-sx2)<g && Math.abs(p.y-sy2)<g) return 'br';
-    if(Math.abs(p.x-mx)<g && Math.abs(p.y-sy1)<g) return 'mt';
-    if(Math.abs(p.x-mx)<g && Math.abs(p.y-sy2)<g) return 'mb';
-    if(Math.abs(p.x-sx1)<g && Math.abs(p.y-my)<g) return 'ml';
-    if(Math.abs(p.x-sx2)<g && Math.abs(p.y-my)<g) return 'mr';
-    if(p.x>sx1 && p.x<sx2 && p.y>sy1 && p.y<sy2) return 'mv';
+    const g = 14;
+    const sx1 = box.x1 * sc, sy1 = box.y1 * sc, sx2 = box.x2 * sc, sy2 = box.y2 * sc;
+    const mx = (sx1 + sx2) / 2, my = (sy1 + sy2) / 2;
+    if (Math.abs(p.x - sx1) < g && Math.abs(p.y - sy1) < g) return 'tl';
+    if (Math.abs(p.x - sx2) < g && Math.abs(p.y - sy1) < g) return 'tr';
+    if (Math.abs(p.x - sx1) < g && Math.abs(p.y - sy2) < g) return 'bl';
+    if (Math.abs(p.x - sx2) < g && Math.abs(p.y - sy2) < g) return 'br';
+    if (Math.abs(p.x - mx) < g && Math.abs(p.y - sy1) < g) return 'mt';
+    if (Math.abs(p.x - mx) < g && Math.abs(p.y - sy2) < g) return 'mb';
+    if (Math.abs(p.x - sx1) < g && Math.abs(p.y - my) < g) return 'ml';
+    if (Math.abs(p.x - sx2) < g && Math.abs(p.y - my) < g) return 'mr';
+    if (p.x > sx1 && p.x < sx2 && p.y > sy1 && p.y < sy2) return 'mv';
     return null;
   }}
 
-  const cursors = {{tl:'nwse-resize',br:'nwse-resize',tr:'nesw-resize',bl:'nesw-resize',mt:'ns-resize',mb:'ns-resize',ml:'ew-resize',mr:'ew-resize',mv:'move'}};
+  const cursors = {{
+    tl: 'nwse-resize', br: 'nwse-resize', tr: 'nesw-resize', bl: 'nesw-resize',
+    mt: 'ns-resize', mb: 'ns-resize', ml: 'ew-resize', mr: 'ew-resize', mv: 'move'
+  }};
 
-  C.addEventListener('mousedown',function(e){{
-    const p=mpos(e); drag=hit(p); ds=p; e.preventDefault();
+  C.addEventListener('mousedown', function(e) {{
+    const p = mpos(e);
+    const h = hit(p);
+    ds = p;
+    origBox = {{ x1: box.x1, y1: box.y1, x2: box.x2, y2: box.y2 }};
+
+    if (h) {{
+      drag = h;
+      isPotentialDraw = false;
+    }} else {{
+      isPotentialDraw = true;
+      drag = null;
+      drawStart = {{ x: p.x, y: p.y }};
+    }}
+    e.preventDefault();
   }});
 
-  C.addEventListener('mousemove',function(e){{
-    const p=mpos(e);
-    const h=hit(p); C.style.cursor=h?cursors[h]||'crosshair':'crosshair';
-    if(!drag) return;
-    const dx=(p.x-ds.x)/sc, dy=(p.y-ds.y)/sc;
-    if(drag==='tl'){{ box.x1+=dx; box.y1+=dy; }}
-    else if(drag==='tr'){{ box.x2+=dx; box.y1+=dy; }}
-    else if(drag==='bl'){{ box.x1+=dx; box.y2+=dy; }}
-    else if(drag==='br'){{ box.x2+=dx; box.y2+=dy; }}
-    else if(drag==='mt'){{ box.y1+=dy; }}
-    else if(drag==='mb'){{ box.y2+=dy; }}
-    else if(drag==='ml'){{ box.x1+=dx; }}
-    else if(drag==='mr'){{ box.x2+=dx; }}
-    else if(drag==='mv'){{ box.x1+=dx; box.y1+=dy; box.x2+=dx; box.y2+=dy; }}
-    box.x1=Math.max(0,Math.min(box.x1,img.width));
-    box.y1=Math.max(0,Math.min(box.y1,img.height));
-    box.x2=Math.max(0,Math.min(box.x2,img.width));
-    box.y2=Math.max(0,Math.min(box.y2,img.height));
-    ds=p; paint();
+  C.addEventListener('mousemove', function(e) {{
+    const p = mpos(e);
+    if (!drag) {{
+      if (isPotentialDraw) {{
+        // Minimum drag distance (~10px) guard before committing to draw mode
+        const dist = Math.hypot(p.x - drawStart.x, p.y - drawStart.y);
+        if (dist >= 10) {{
+          drag = 'draw';
+        }}
+      }} else {{
+        const h = hit(p);
+        C.style.cursor = h ? cursors[h] || 'crosshair' : 'crosshair';
+        return;
+      }}
+    }}
+
+    if (drag === 'draw') {{
+      C.style.cursor = 'crosshair';
+      const curX = Math.max(0, Math.min(p.x / sc, img.width));
+      const curY = Math.max(0, Math.min(p.y / sc, img.height));
+      const sx = Math.max(0, Math.min(drawStart.x / sc, img.width));
+      const sy = Math.max(0, Math.min(drawStart.y / sc, img.height));
+      box.x1 = Math.min(sx, curX);
+      box.y1 = Math.min(sy, curY);
+      box.x2 = Math.max(sx, curX);
+      box.y2 = Math.max(sy, curY);
+      paint();
+      return;
+    }}
+
+    const dx = (p.x - ds.x) / sc, dy = (p.y - ds.y) / sc;
+    if (drag === 'tl') {{ box.x1 += dx; box.y1 += dy; }}
+    else if (drag === 'tr') {{ box.x2 += dx; box.y1 += dy; }}
+    else if (drag === 'bl') {{ box.x1 += dx; box.y2 += dy; }}
+    else if (drag === 'br') {{ box.x2 += dx; box.y2 += dy; }}
+    else if (drag === 'mt') {{ box.y1 += dy; }}
+    else if (drag === 'mb') {{ box.y2 += dy; }}
+    else if (drag === 'ml') {{ box.x1 += dx; }}
+    else if (drag === 'mr') {{ box.x2 += dx; }}
+    else if (drag === 'mv') {{ box.x1 += dx; box.y1 += dy; box.x2 += dx; box.y2 += dy; }}
+
+    box.x1 = Math.max(0, Math.min(box.x1, img.width));
+    box.y1 = Math.max(0, Math.min(box.y1, img.height));
+    box.x2 = Math.max(0, Math.min(box.x2, img.width));
+    box.y2 = Math.max(0, Math.min(box.y2, img.height));
+    ds = p;
+    paint();
   }});
 
-  function endDrag(){{
-    if(!drag) return;
-    drag=null;
-    if(box.x1>box.x2){{ let t=box.x1; box.x1=box.x2; box.x2=t; }}
-    if(box.y1>box.y2){{ let t=box.y1; box.y1=box.y2; box.y2=t; }}
-    paint(); syncGradio();
+  function endDrag() {{
+    if (isPotentialDraw && drag !== 'draw') {{
+      // Near-miss click outside handles (<10px drag): guard preserves original box
+      box = {{ x1: origBox.x1, y1: origBox.y1, x2: origBox.x2, y2: origBox.y2 }};
+      isPotentialDraw = false;
+      drag = null;
+      paint();
+      return;
+    }}
+
+    if (!drag) return;
+
+    if (drag === 'draw') {{
+      // Guard: Check if drawn box is at least 10x10 px
+      if (Math.abs(box.x2 - box.x1) < 10 || Math.abs(box.y2 - box.y1) < 10) {{
+        box = {{ x1: origBox.x1, y1: origBox.y1, x2: origBox.x2, y2: origBox.y2 }};
+      }}
+    }}
+
+    drag = null;
+    isPotentialDraw = false;
+
+    if (box.x1 > box.x2) {{ let t = box.x1; box.x1 = box.x2; box.x2 = t; }}
+    if (box.y1 > box.y2) {{ let t = box.y1; box.y1 = box.y2; box.y2 = t; }}
+
+    paint();
+    syncGradio();
   }}
+
   C.addEventListener('mouseup', endDrag);
   C.addEventListener('mouseleave', endDrag);
 
-  function syncGradio(){{
-    // Reach into parent document (Gradio page) to update the number inputs
+  function syncGradio() {{
     var pwin;
-    try {{ pwin = window.parent; }} catch(e) {{ pwin = window; }}
-    var pdoc = pwin.document;
-    function setN(eid, v){{
+    try {{ pwin = window.parent || window; }} catch(e) {{ pwin = window; }}
+    var pdoc;
+    try {{ pdoc = pwin.document; }} catch(e) {{ return; }}
+    if (!pdoc) return;
+
+    function setN(eid, v) {{
       var el = pdoc.getElementById(eid);
-      if(!el) return;
-      var inp = el.querySelector('input[type="number"]');
-      if(!inp) return;
-      var s = Object.getOwnPropertyDescriptor(pwin.HTMLInputElement.prototype,'value');
-      if(s && s.set) {{ s.set.call(inp, Math.round(v)); }}
-      else {{ inp.value = Math.round(v); }}
-      inp.dispatchEvent(new Event('input',{{bubbles:true}}));
-      inp.dispatchEvent(new Event('change',{{bubbles:true}}));
+      if (!el) return;
+      var inp = el.querySelector('input');
+      if (!inp) return;
+      var val = Math.round(v);
+      var s = Object.getOwnPropertyDescriptor(pwin.HTMLInputElement.prototype, 'value');
+      if (s && s.set) {{ s.set.call(inp, val); }}
+      else {{ inp.value = val; }}
+      inp.dispatchEvent(new Event('input', {{ bubbles: true }}));
+      inp.dispatchEvent(new Event('change', {{ bubbles: true }}));
     }}
-    setN('ds_bbox_x1', box.x1);
-    setN('ds_bbox_y1', box.y1);
-    setN('ds_bbox_x2', box.x2);
-    setN('ds_bbox_y2', box.y2);
+    setN('{elem_prefix}x1', box.x1);
+    setN('{elem_prefix}y1', box.y1);
+    setN('{elem_prefix}x2', box.x2);
+    setN('{elem_prefix}y2', box.y2);
   }}
 }})();
 </script>
@@ -1383,9 +3026,10 @@ def get_full_frame_with_overlay():
     frame_rgb = _get_frame_rgb_for_candidate(c)
     if frame_rgb is None:
         return render_bbox_editor_html(None, (0,0,0,0)), 0, 0, 0, 0
-    x1, y1, x2, y2 = c.bbox
-    html = render_bbox_editor_html(frame_rgb, c.bbox)
-    return html, int(x1), int(y1), int(x2), int(y2)
+    x1, y1, x2, y2 = [int(v) for v in c.bbox]
+    overlays = _get_staged_overlays_for_frame(c.source_video, c.frame_number)
+    html = render_bbox_editor_html(frame_rgb, c.bbox, staged_overlays=overlays)
+    return html, x1, y1, x2, y2
 
 
 def adjust_bbox_with_padding(padding_px):
@@ -1424,7 +3068,8 @@ def adjust_bbox_with_padding(padding_px):
     c.crop_image = new_crop
 
     crop_rgb = cv2.cvtColor(new_crop, cv2.COLOR_BGR2RGB)
-    html = render_bbox_editor_html(frame_rgb, new_bbox)
+    overlays = _get_staged_overlays_for_frame(c.source_video, c.frame_number)
+    html = render_bbox_editor_html(frame_rgb, new_bbox, staged_overlays=overlays)
     return crop_rgb, html, nx1, ny1, nx2, ny2
 
 
@@ -1459,7 +3104,8 @@ def apply_bbox_coord_adjustment(x1, y1, x2, y2):
     c.crop_image = new_crop
 
     crop_rgb = cv2.cvtColor(new_crop, cv2.COLOR_BGR2RGB)
-    html = render_bbox_editor_html(frame_rgb, new_bbox)
+    overlays = _get_staged_overlays_for_frame(c.source_video, c.frame_number)
+    html = render_bbox_editor_html(frame_rgb, new_bbox, staged_overlays=overlays)
     return crop_rgb, html
 
 
@@ -1485,7 +3131,8 @@ def reset_bbox_to_original():
     c.crop_image = new_crop
 
     crop_rgb = cv2.cvtColor(new_crop, cv2.COLOR_BGR2RGB)
-    html = render_bbox_editor_html(frame_rgb, c.initial_bbox)
+    overlays = _get_staged_overlays_for_frame(c.source_video, c.frame_number)
+    html = render_bbox_editor_html(frame_rgb, c.initial_bbox, staged_overlays=overlays)
     return crop_rgb, html, ix1, iy1, ix2, iy2, 0
 
 
@@ -1508,8 +3155,12 @@ def test_cloud_connection(url):
     except Exception as e:
         return f"<div class='sys-bar'><span class='sys-metric'><span class='label' style='color:#f87171;'>✗ Unreachable: {e}</span></span></div>"
 
-def process_video_cloud(video_path, model_name, url, progress=gr.Progress()):
+def process_video_cloud(video_path, model_name, url, enable_segmentation=True, progress=gr.Progress()):
     """Sends video and model to Cloud GPU for processing."""
+    if isinstance(video_path, dict):
+        video_path = video_path.get("path") or video_path.get("name") or video_path.get("video", {}).get("path")
+    elif hasattr(video_path, "path"):
+        video_path = video_path.path
     if not video_path or not os.path.exists(video_path):
         raise gr.Error("Invalid or missing video input file.")
     if not url:
@@ -1533,7 +3184,8 @@ def process_video_cloud(video_path, model_name, url, progress=gr.Progress()):
             progress(0.05, desc="Uploading video and model to Cloud GPU (this may take a minute)...")
             
             # 1. Start the job
-            r = requests.post(f"{url}/process", files=files)
+            data = {"enable_segmentation": str(enable_segmentation).lower()}
+            r = requests.post(f"{url}/process", files=files, data=data)
             
             if r.status_code != 200:
                 try:
@@ -1630,10 +3282,10 @@ def process_video_cloud(video_path, model_name, url, progress=gr.Progress()):
                     zip_ref.extractall(extract_path)
             except Exception as e:
                 print(f"[Cloud GPU] Warning: failed to extract zip: {e}")
-                return out_path, None, None, [], f"⚠️ Could not extract zip to display results: {e}", []
+                return out_path, None, None, [], f"⚠️ Could not extract zip to display results: {e}", [], []
                 
             # Load details using existing function
-            v, csv, crops, summary, charts = load_history_details(run_folder_name)
+            v, csv, crops, summary, charts, segs, *_ = load_history_details(run_folder_name)
             
             # Reconstruct PipelineResult for Dataset Builder
             try:
@@ -1646,6 +3298,12 @@ def process_video_cloud(video_path, model_name, url, progress=gr.Progress()):
                     _ANNOTATION_STATE["last_pipeline_result"] = PipelineResult.from_dict(result_dict)
                     _ANNOTATION_STATE["last_video_path"] = video_path
                     _ANNOTATION_STATE["last_inspection_mode"] = "dedup"
+
+                    # Store result for GIS enrichment
+                    _GIS_STATE["last_video_path"] = video_path
+                    _GIS_STATE["last_output_dir"] = os.path.join(OUTPUTS_DIR, run_folder_name)
+                    _GIS_STATE["last_summary_path"] = summary_json_path
+                    _GIS_STATE["last_pipeline_result"] = _ANNOTATION_STATE["last_pipeline_result"]
             except Exception as e:
                 print(f"[Cloud GPU] Warning: failed to parse PipelineResult for dataset builder: {e}")
             
@@ -1656,7 +3314,7 @@ def process_video_cloud(video_path, model_name, url, progress=gr.Progress()):
             except Exception as e:
                 print(f"[Cloud GPU] Warning: failed to delete zip file: {e}")
                 
-            return None, v, csv, crops, summary, charts
+            return None, v, csv, crops, summary, charts, segs
     except requests.exceptions.RequestException as e:
         raise gr.Error(f"Network error connecting to Cloud GPU: {str(e)}")
 
@@ -1698,16 +3356,22 @@ def download_cloud_run(run_name, url):
 
 
 def _process_video_legacy(video_path, model_name, conf_threshold, iou_threshold,
-                          frame_skip, progress):
+                          frame_skip, progress, custom_class_thresholds=None,
+                          cam_height=1.2, cam_tilt=15.0, cam_focal=1200.0):
     """
     Original frame-by-frame detection without tracking or dedup.
     Used as fallback when dedup is disabled or in Demo mode.
+    Supports dynamic per-class custom confidence thresholds.
+    Estimates real-world ground area (m²) for Pothole, Manhole, and Patch road defects.
     """
     if not video_path or not os.path.exists(video_path):
         return None, None, [], "❌ Error: Invalid or missing video input file.", []
 
     start_time = time.time()
     import re as _re
+    from rdd_dedup.measurement.area_calculator import (
+        CameraParams, compute_defect_area, is_area_eligible_class
+    )
 
     # Build videoname_modelname folder name
     _video_name = os.path.splitext(os.path.basename(video_path))[0]
@@ -1740,6 +3404,15 @@ def _process_video_legacy(video_path, model_name, conf_threshold, iou_threshold,
     if total_frames <= 0:
         total_frames = 300  # Fallback estimate
 
+    # Camera calibration for ground area calculation
+    camera_params = CameraParams(
+        yc=float(cam_height or 1.2),
+        tilt_deg=float(cam_tilt or 15.0),
+        f=float(cam_focal) if cam_focal else None,
+        image_width=width,
+        image_height=height,
+    )
+
     # Output file paths
     temp_avi = os.path.join(run_output_dir, "processed_raw.avi")
     final_mp4 = os.path.join(run_output_dir, f"output_video_{timestamp_str}.mp4")
@@ -1752,12 +3425,18 @@ def _process_video_legacy(video_path, model_name, conf_threshold, iou_threshold,
     # Load RDD-YOLO Model and class names
     model, class_map = load_yolo_model(model_name)
 
+    # Base confidence for YOLO prediction
+    valid_thresholds = [v for v in custom_class_thresholds.values() if isinstance(v, (int, float))] if custom_class_thresholds else []
+    base_conf = min(valid_thresholds) if valid_thresholds else float(conf_threshold)
+    base_conf = max(0.05, min(base_conf, float(conf_threshold)))
+
     # Prepare CSV Writer
     csv_records = []
     csv_headers = [
         "detection_id", "frame_index", "timestamp_sec",
         "class_id", "class_name", "confidence",
         "bbox_x1", "bbox_y1", "bbox_x2", "bbox_y2",
+        "real_area_m2",
         "crop_filename"
     ]
 
@@ -1793,23 +3472,46 @@ def _process_video_legacy(video_path, model_name, conf_threshold, iou_threshold,
 
             # Perform inference using RDD-YOLO
             if model is not None:
-                results = model.predict(frame, conf=conf_threshold, iou=iou_threshold, verbose=False)
+                results = model.predict(frame, conf=base_conf, iou=iou_threshold, verbose=False)
                 for r in results:
                     boxes = r.boxes
-                    for box in boxes:
+                    for box_idx, box in enumerate(boxes):
                         cls_id = int(box.cls[0].item())
-
                         conf = float(box.conf[0].item())
-                        xyxy = box.xyxy[0].cpu().numpy().astype(int)
-                        # Map class info dynamically
+
                         cls_cfg = class_map.get(cls_id, {"name": f"Class-{cls_id}", "color": (0, 0, 255)})
                         cls_name = cls_cfg["name"]
                         color = cls_cfg["color"]
 
+                        # Check per-class threshold
+                        thresh = custom_class_thresholds.get(
+                            cls_name,
+                            custom_class_thresholds.get(
+                                str(cls_name).upper(),
+                                custom_class_thresholds.get(cls_id, float(conf_threshold))
+                            )
+                        ) if custom_class_thresholds else float(conf_threshold)
+                        if conf < thresh:
+                            continue
+
                         # Coordinates
+                        xyxy = [int(v.item()) for v in box.xyxy[0]]
                         x1, y1, x2, y2 = xyxy
                         x1_c, y1_c = max(0, x1), max(0, y1)
                         x2_c, y2_c = min(width, x2), min(height, y2)
+
+                        # Extract segmentation polygon if available from YOLO-Seg
+                        polygon = None
+                        if hasattr(r, "masks") and r.masks is not None:
+                            if hasattr(r.masks, "xy") and len(r.masks.xy) > box_idx:
+                                poly_cand = r.masks.xy[box_idx]
+                                if poly_cand is not None and len(poly_cand) >= 3:
+                                    polygon = poly_cand
+
+                        # Calculate real-world ground area ONLY for Pothole, Manhole, and Patch
+                        area_m2 = None
+                        if is_area_eligible_class(cls_name):
+                            area_m2 = compute_defect_area((x1, y1, x2, y2), camera_params, cls_name, polygon)
 
                         total_detections += 1
                         current_frame_detections += 1
@@ -1826,7 +3528,11 @@ def _process_video_legacy(video_path, model_name, conf_threshold, iou_threshold,
                             # Add to UI gallery (up to 60 crops max for fast UI rendering)
                             if len(crop_gallery_images) < 60:
                                 crop_rgb = cv2.cvtColor(crop_patch, cv2.COLOR_BGR2RGB)
-                                crop_gallery_images.append((crop_rgb, f"{cls_name} ({conf:.2f}) - t={timestamp_sec}s"))
+                                caption = f"{cls_name} ({conf:.2f})"
+                                if area_m2 is not None and area_m2 > 0:
+                                    caption += f" | {area_m2:.2f} m²"
+                                caption += f" - t={timestamp_sec}s"
+                                crop_gallery_images.append((crop_rgb, caption))
 
                         # Record to CSV
                         csv_records.append({
@@ -1840,12 +3546,27 @@ def _process_video_legacy(video_path, model_name, conf_threshold, iou_threshold,
                             "bbox_y1": y1,
                             "bbox_x2": x2,
                             "bbox_y2": y2,
+                            "real_area_m2": round(area_m2, 4) if area_m2 is not None else None,
                             "crop_filename": crop_filename
                         })
 
+                        # Live YOLO segmentation overlay and crisp contour if available
+                        if polygon is not None and len(polygon) >= 3:
+                            try:
+                                poly_pts = np.int32([polygon])
+                                overlay = frame.copy()
+                                cv2.fillPoly(overlay, poly_pts, color)
+                                cv2.addWeighted(overlay, 0.35, frame, 0.65, 0, frame)
+                                cv2.polylines(frame, poly_pts, isClosed=True, color=color, thickness=2, lineType=cv2.LINE_AA)
+                            except Exception:
+                                pass
+
                         # Draw Bounding Box & Label on Output Frame
                         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                        label_str = f"{cls_name} {conf:.2f}"
+                        if area_m2 is not None and area_m2 > 0:
+                            label_str = f"{cls_name} {conf:.2f} | {area_m2:.2f} m2"
+                        else:
+                            label_str = f"{cls_name} {conf:.2f}"
                         (w, h), _ = cv2.getTextSize(label_str, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
                         cv2.rectangle(frame, (x1, max(0, y1 - 20)), (x1 + w + 10, y1), color, -1)
                         cv2.putText(frame, label_str, (x1 + 5, max(12, y1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
@@ -1857,6 +3578,8 @@ def _process_video_legacy(video_path, model_name, conf_threshold, iou_threshold,
                     x2, y2 = int(width * 0.55), int(height * 0.85)
                     cls_cfg = DEFAULT_RDD_CLASSES[3]  # Pothole
                     color = cls_cfg["color"]
+
+                    demo_area = compute_defect_area((x1, y1, x2, y2), camera_params, "Pothole")
 
                     total_detections += 1
                     current_frame_detections += 1
@@ -1870,7 +3593,10 @@ def _process_video_legacy(video_path, model_name, conf_threshold, iou_threshold,
                         cv2.imwrite(crop_filepath, crop_patch)
                         if len(crop_gallery_images) < 60:
                             crop_rgb = cv2.cvtColor(crop_patch, cv2.COLOR_BGR2RGB)
-                            crop_gallery_images.append((crop_rgb, f"{cls_cfg['name']} (0.89 Demo)"))
+                            caption = f"{cls_cfg['name']} (0.89 Demo)"
+                            if demo_area:
+                                caption += f" | {demo_area:.2f} m²"
+                            crop_gallery_images.append((crop_rgb, caption))
 
                     csv_records.append({
                         "detection_id": total_detections,
@@ -1883,12 +3609,13 @@ def _process_video_legacy(video_path, model_name, conf_threshold, iou_threshold,
                         "bbox_y1": y1,
                         "bbox_x2": x2,
                         "bbox_y2": y2,
+                        "real_area_m2": round(demo_area, 4) if demo_area else None,
                         "crop_filename": crop_filename
                     })
 
                     cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
-                    label_str = f"{cls_cfg['name']} 0.89 (Demo)"
-                    cv2.rectangle(frame, (x1, y1 - 22), (x1 + 220, y1), color, -1)
+                    label_str = f"{cls_cfg['name']} 0.89 (Demo) | {demo_area:.2f} m2" if demo_area else f"{cls_cfg['name']} 0.89 (Demo)"
+                    cv2.rectangle(frame, (x1, y1 - 22), (x1 + 250, y1), color, -1)
                     cv2.putText(frame, label_str, (x1 + 5, y1 - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
 
             # Render HUD Analytics Overlay on top of frame
@@ -1946,13 +3673,17 @@ def _process_video_legacy(video_path, model_name, conf_threshold, iou_threshold,
                 last_frame=rec["frame_index"],
                 detection_duration_frames=1,
                 frames_observed=1,
-                avg_center=((x1 + x2) / 2.0, (y1 + y2) / 2.0),
+                representative_center=((x1 + x2) / 2.0, (y1 + y2) / 2.0),
                 avg_bbox_area=float(max(0, x2 - x1) * max(0, y2 - y1)),
                 avg_aspect_ratio=float(max(1, x2 - x1) / max(1, y2 - y1)),
                 bbox_stats={},
                 representative_crop_path=crop_path,
-                source_track_ids=[rec["detection_id"]]
+                representative_bbox=(x1, y1, x2, y2),
+                source_track_ids=[rec["detection_id"]],
+                real_area_m2=rec.get("real_area_m2")
             )
+            if raw_defect.real_area_m2 is not None:
+                raw_defect.measurement_data = {"real_area_m2": raw_defect.real_area_m2}
             raw_finalized_defects.append(raw_defect)
 
         raw_pipeline_result = PipelineResult(
@@ -1974,6 +3705,12 @@ def _process_video_legacy(video_path, model_name, conf_threshold, iou_threshold,
         _ANNOTATION_STATE["last_pipeline_result"] = raw_pipeline_result
         _ANNOTATION_STATE["last_video_path"] = video_path
         _ANNOTATION_STATE["last_inspection_mode"] = "raw"
+
+        # Store result for GIS enrichment
+        _GIS_STATE["last_video_path"] = video_path
+        _GIS_STATE["last_output_dir"] = run_output_dir
+        _GIS_STATE["last_summary_path"] = os.path.join(run_output_dir, "summary.json")
+        _GIS_STATE["last_pipeline_result"] = raw_pipeline_result
     except Exception as e:
         print(f"[Warning] Could not construct raw PipelineResult for dataset builder: {e}")
 
@@ -1997,10 +3734,16 @@ def _process_video_legacy(video_path, model_name, conf_threshold, iou_threshold,
         "processing_time_sec": round(elapsed_time, 2),
         "fps": round(proc_fps, 1),
         "total_defects_detected": total_detections,
-        "defect_counts": class_counts
+        "defect_counts": class_counts,
+        "camera_calibration": {
+            "camera_height_m": float(cam_height or 1.2),
+            "camera_tilt_deg": float(cam_tilt or 15.0),
+            "camera_focal_length_px": float(cam_focal) if cam_focal else None,
+        },
+        "finalized_defects": [d.to_dict() if hasattr(d, "to_dict") else d for d in raw_finalized_defects]
     }
     with open(os.path.join(run_output_dir, "summary.json"), "w", encoding="utf-8") as f:
-        json.dump(summary_data, f, indent=2)
+        json.dump(summary_data, f, indent=2, default=str)
 
     # Build Summary Report Markdown
     summary_md = f"""
@@ -2022,6 +3765,16 @@ def _process_video_legacy(video_path, model_name, conf_threshold, iou_threshold,
     for cls_name, count in class_counts.items():
         summary_md += f"- **{cls_name}**: `{count}` detected\n"
 
+    # Defect Area Measurements (Pothole, Manhole, Patch only)
+    legacy_area_entries = [r for r in csv_records if r.get("real_area_m2")]
+    if legacy_area_entries:
+        summary_md += "\n#### 📐 Real-World Defect Area Measurements (Pothole / Manhole / Patch):\n"
+        summary_md += f"*Camera Height: `{cam_height}m` · Downward Tilt: `{cam_tilt}°` · Focal Length: `{cam_focal}px`*\n\n"
+        for r in legacy_area_entries[:15]:
+            summary_md += f"- **{r['class_name']}** (Frame #{r['frame_index']}): **{r['real_area_m2']:.3f} m²** (conf: {r['confidence']:.2f})\n"
+        if len(legacy_area_entries) > 15:
+            summary_md += f"- *...and {len(legacy_area_entries) - 15} more (see CSV for full details)*\n"
+
     summary_md += f"\n📁 *All files saved to: `{run_output_dir}`*"
 
     # Generate visualization charts
@@ -2042,6 +3795,7 @@ def _process_video_legacy(video_path, model_name, conf_threshold, iou_threshold,
 def build_ui():
     available_models = get_available_models()
     example_videos = get_example_videos()
+    example_gpx_files = get_example_gpx_files()
     history_runs = get_history_runs()
 
     custom_css = """
@@ -2290,6 +4044,197 @@ def build_ui():
         border: none;
     }
 
+    /* ─── Dataset Builder Wizard Panels & Active Step Hierarchy ─── */
+    .ds-wizard-panel {
+        border-radius: var(--radius-lg) !important;
+        padding: 1rem !important;
+        transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1) !important;
+        position: relative;
+    }
+    .ds-candidate-step {
+        background: linear-gradient(180deg, rgba(14, 28, 48, 0.65) 0%, rgba(15, 15, 25, 0.88) 100%) !important;
+        border: 1px solid rgba(56, 189, 248, 0.35) !important;
+        box-shadow: 0 0 30px rgba(56, 189, 248, 0.08), inset 0 1px 0 rgba(56, 189, 248, 0.2) !important;
+    }
+    .ds-candidate-step::before {
+        content: "STAGE 1 · CANDIDATE REVIEW & EDITING";
+        display: inline-block;
+        font-family: 'Inter', sans-serif;
+        font-size: 0.72rem;
+        font-weight: 800;
+        letter-spacing: 0.08em;
+        color: #38bdf8;
+        background: rgba(56, 189, 248, 0.12);
+        border: 1px solid rgba(56, 189, 248, 0.3);
+        padding: 2px 10px;
+        border-radius: 9999px;
+        margin-bottom: 0.6rem;
+        width: fit-content;
+    }
+    .ds-review-step {
+        background: linear-gradient(180deg, rgba(6, 44, 28, 0.55) 0%, rgba(15, 15, 25, 0.9) 100%) !important;
+        border: 1px solid rgba(16, 185, 129, 0.4) !important;
+        box-shadow: 0 0 35px rgba(16, 185, 129, 0.1), inset 0 1px 0 rgba(16, 185, 129, 0.25) !important;
+    }
+    .ds-review-step::before {
+        content: "STAGE 2 · BATCH VERIFICATION & DATASET COMMIT";
+        display: inline-block;
+        font-family: 'Inter', sans-serif;
+        font-size: 0.72rem;
+        font-weight: 800;
+        letter-spacing: 0.08em;
+        color: #34d399;
+        background: rgba(16, 185, 129, 0.12);
+        border: 1px solid rgba(16, 185, 129, 0.3);
+        padding: 2px 10px;
+        border-radius: 9999px;
+        margin-bottom: 0.6rem;
+        width: fit-content;
+    }
+    .ds-curate-step {
+        background: linear-gradient(180deg, rgba(28, 14, 48, 0.65) 0%, rgba(15, 15, 25, 0.9) 100%) !important;
+        border: 1px solid rgba(168, 85, 247, 0.4) !important;
+        box-shadow: 0 0 35px rgba(168, 85, 247, 0.1), inset 0 1px 0 rgba(168, 85, 247, 0.25) !important;
+    }
+    .ds-curate-step::before {
+        content: "RDD_AHMEDABAD · DEFECT INSPECTOR & CROP REPAIR";
+        display: inline-block;
+        font-family: 'Inter', sans-serif;
+        font-size: 0.72rem;
+        font-weight: 800;
+        letter-spacing: 0.08em;
+        color: #c084fc;
+        background: rgba(168, 85, 247, 0.12);
+        border: 1px solid rgba(168, 85, 247, 0.3);
+        padding: 2px 10px;
+        border-radius: 9999px;
+        margin-bottom: 0.6rem;
+        width: fit-content;
+    }
+
+    /* ─── Compact Candidate Information Card ─── */
+    .ds-candidate-card {
+        background: rgba(255, 255, 255, 0.02);
+        border: 1px solid var(--border-subtle);
+        border-radius: var(--radius-sm);
+        padding: 8px 10px;
+        margin: 4px 0 6px 0;
+    }
+    .ds-card-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        margin-bottom: 4px;
+    }
+    .ds-detection-num {
+        font-weight: 700;
+        font-size: 0.88rem;
+        color: var(--text-primary);
+    }
+    .ds-conf-pill {
+        font-size: 0.72rem;
+        font-weight: 700;
+        padding: 1px 7px;
+        border-radius: 9999px;
+        background: rgba(56, 189, 248, 0.15);
+        color: #38bdf8;
+        border: 1px solid rgba(56, 189, 248, 0.3);
+    }
+    .ds-meta-grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 6px;
+        font-size: 0.8rem;
+    }
+    .ds-meta-item {
+        display: flex;
+        align-items: center;
+        gap: 4px;
+        overflow: hidden;
+    }
+    .ds-meta-lbl {
+        color: var(--text-muted);
+        font-size: 0.75rem;
+        font-weight: 600;
+    }
+    .ds-meta-val {
+        color: var(--text-primary);
+        font-weight: 600;
+        white-space: nowrap;
+        text-overflow: ellipsis;
+        overflow: hidden;
+    }
+    .ds-details-accordion {
+        margin-top: 6px;
+        background: rgba(0, 0, 0, 0.2);
+        border: 1px solid rgba(255, 255, 255, 0.05);
+        border-radius: var(--radius-sm);
+        overflow: hidden;
+    }
+    .ds-details-accordion[open] {
+        border-color: rgba(56, 189, 248, 0.25);
+    }
+    .ds-details-accordion summary {
+        padding: 4px 8px;
+        font-size: 0.74rem;
+        font-weight: 600;
+        color: var(--text-secondary);
+        cursor: pointer;
+        user-select: none;
+    }
+    .ds-details-accordion summary:hover {
+        color: var(--text-primary);
+    }
+    .ds-details-content {
+        padding: 6px 8px;
+        border-top: 1px solid rgba(255, 255, 255, 0.05);
+        font-size: 0.72rem;
+        color: var(--text-muted);
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 4px;
+    }
+    .ds-details-content code {
+        font-family: 'JetBrains Mono', monospace;
+        color: var(--text-secondary);
+        font-size: 0.72rem;
+    }
+
+    /* ─── Compact Inline Coordinate Row ─── */
+    .ds-coords-row {
+        display: flex !important;
+        flex-direction: row !important;
+        gap: 6px !important;
+        margin-top: 4px !important;
+        margin-bottom: 4px !important;
+        padding: 4px 6px !important;
+        background: rgba(255, 255, 255, 0.015) !important;
+        border: 1px solid rgba(255, 255, 255, 0.05) !important;
+        border-radius: var(--radius-sm) !important;
+        align-items: center !important;
+    }
+    .ds-coords-row > div {
+        min-width: 0 !important;
+        flex: 1 1 0 !important;
+    }
+    .ds-coords-row label {
+        font-size: 0.65rem !important;
+        font-weight: 600 !important;
+        color: var(--text-muted) !important;
+        margin-bottom: 0px !important;
+        text-transform: uppercase !important;
+        letter-spacing: 0.05em !important;
+    }
+    .ds-coords-row input {
+        height: 26px !important;
+        min-height: 26px !important;
+        padding: 2px 4px !important;
+        font-family: 'JetBrains Mono', monospace !important;
+        font-size: 0.78rem !important;
+        text-align: center !important;
+        background: rgba(0, 0, 0, 0.35) !important;
+    }
+
     /* ─── Dataset Builder Card ─── */
     .ds-action-row button {
         font-weight: 600 !important;
@@ -2414,14 +4359,28 @@ def build_ui():
                             sources=["upload"],
                             interactive=True
                         )
+                        with gr.Row():
+                            quick_sample_dd = gr.Dropdown(
+                                choices=example_videos,
+                                value=None,
+                                label="📁 Quick Select from inputs/ directory",
+                                info="Pick existing footage directly without re-uploading",
+                                scale=4
+                            )
+                            btn_refresh_samples = gr.Button("🔄", scale=1, min_width=48)
                         video_est_md = gr.Markdown("")
 
                         with gr.Accordion("⚙️ Detection Model & Parameters", open=True):
+                            openvino_toggle = gr.Checkbox(
+                                value=False,
+                                label="⚡ Use OpenVINO Models (Folders)",
+                                info="Toggle ON for OpenVINO model folders · Toggle OFF for Normal (.pt) weights",
+                            )
                             with gr.Row():
                                 model_selector = gr.Dropdown(
                                     choices=available_models,
-                                    value=available_models[0],
-                                    label="Model Weights",
+                                    value=available_models[0] if available_models else None,
+                                    label="Model Weights (.pt)",
                                     info="Auto-detected from models/ directory",
                                     scale=4
                                 )
@@ -2454,6 +4413,37 @@ def build_ui():
                                 info="1 = all frames · 2 = every 2nd frame"
                             )
 
+                            # ── Dynamic Per-Class Confidence Thresholds ──
+                            initial_model = available_models[0] if available_models else "rdd_yolo.pt"
+                            initial_classes = get_model_class_dict(initial_model)
+                            initial_items = list(initial_classes.items())
+
+                            with gr.Accordion("🎯 Custom Per-Class Confidence Thresholds", open=True) as per_class_accordion:
+                                per_class_info_md = gr.Markdown(
+                                    f"🎯 **{len(initial_items)} classes detected** for `{os.path.basename(initial_model)}`. Configure independent detection sensitivity per class:"
+                                )
+                                with gr.Row():
+                                    btn_sync_all_conf = gr.Button("⚡ Sync All to Master Confidence", size="sm", scale=1)
+                                    btn_reset_all_conf = gr.Button("🔄 Reset to 0.25", size="sm", scale=1)
+
+                                class_sliders = []
+                                for r_idx in range(MAX_CLASS_SLIDERS // 2):
+                                    with gr.Row():
+                                        for c_idx in range(2):
+                                            s_idx = r_idx * 2 + c_idx
+                                            is_vis = s_idx < len(initial_items)
+                                            c_lbl = f"[{initial_items[s_idx][0]}] {initial_items[s_idx][1]}" if is_vis else f"Class {s_idx}"
+                                            s = gr.Slider(
+                                                minimum=0.05,
+                                                maximum=0.95,
+                                                value=0.25,
+                                                step=0.05,
+                                                label=c_lbl,
+                                                visible=is_vis,
+                                                elem_id=f"class_conf_slider_{s_idx}"
+                                            )
+                                            class_sliders.append(s)
+
                         with gr.Accordion("🔄 Duplicate Removal Pipeline", open=True):
                             enable_dedup = gr.Checkbox(
                                 value=True,
@@ -2482,11 +4472,46 @@ def build_ui():
                                     info="Frames to keep lost tracks alive",
                                 )
 
+                        with gr.Accordion("📐 Camera Calibration & Area Estimation", open=True):
+                            gr.HTML('<div style="font-size:0.85rem; color:#94a3b8; margin-bottom:8px;">Calibrate flat-plane camera parameters to compute physical ground area (m²) for <b>Pothole</b>, <b>Manhole</b>, and <b>Patch</b> road defects.</div>')
+                            with gr.Row():
+                                cam_height_slider = gr.Slider(
+                                    minimum=0.5,
+                                    maximum=3.5,
+                                    value=1.2,
+                                    step=0.1,
+                                    label="Camera Height (yc)",
+                                    info="Height above road surface (meters)"
+                                )
+                                cam_tilt_slider = gr.Slider(
+                                    minimum=1.0,
+                                    maximum=60.0,
+                                    value=15.0,
+                                    step=1.0,
+                                    label="Downward Tilt (θ)",
+                                    info="Downward tilt in degrees"
+                                )
+                                cam_focal_slider = gr.Slider(
+                                    minimum=300.0,
+                                    maximum=3000.0,
+                                    value=1200.0,
+                                    step=50.0,
+                                    label="Focal Length (f)",
+                                    info="Focal length in pixels"
+                                )
+
+                        with gr.Accordion("✨ YOLO Segmentation", open=True):
+                            enable_seg_ui = gr.Checkbox(
+                                value=True,
+                                label="✨ Enable YOLO Segmentation",
+                                info="Toggle ON to segment detected defects using YOLO-Seg and measure exact polygon contour area. Toggle OFF for bounding box corners."
+                            )
+
                         with gr.Row(elem_classes="run-btn"):
                             btn_process = gr.Button("🚀 Run RDD-YOLO Detection + Dedup", variant="primary", scale=2)
                             btn_process_cloud = gr.Button("🚀 Run on Cloud GPU", variant="primary", scale=2, visible=False)
                             btn_revoke = gr.Button("🛑 Revoke Process", variant="stop", scale=1)
-                            btn_clear = gr.ClearButton(components=[input_video], value="✕ Clear", scale=1)
+                            btn_clear = gr.ClearButton(components=[input_video, quick_sample_dd], value="✕ Clear", scale=1)
 
                     # Right Column: Live Telemetry & Output Results
                     with gr.Column(scale=6):
@@ -2511,6 +4536,44 @@ def build_ui():
                                 "Upload road video footage and click **Run RDD-YOLO Detection + Dedup** to begin automated inspection."
                             )
 
+                            # ── Geolocation & GIS Map Enrichment Section ──
+                            with gr.Accordion("🗺️ Geolocation & GIS Map Enrichment", open=True) as gis_accordion:
+                                gr.HTML('<div style="font-size:0.88rem; color:#94a3b8; margin-bottom:8px;">Synchronize finalized unique defects with GPX survey trackpoints to generate GeoJSON and an interactive map.</div>')
+                                with gr.Row():
+                                    gis_gpx_upload = gr.File(
+                                        label="Upload GPX Survey Track (.gpx)",
+                                        file_types=[".gpx"],
+                                        file_count="single",
+                                        interactive=True,
+                                        scale=3
+                                    )
+                                    gis_gpx_dropdown = gr.Dropdown(
+                                        choices=example_gpx_files,
+                                        value=example_gpx_files[0] if example_gpx_files else None,
+                                        label="📁 Quick Select GPX from inputs/",
+                                        info="Pick existing GPX survey log",
+                                        scale=3
+                                    )
+                                    btn_refresh_gpx = gr.Button("🔄", scale=1, min_width=48)
+                                with gr.Row():
+                                    gis_offset_slider = gr.Slider(
+                                        minimum=-30.0,
+                                        maximum=30.0,
+                                        value=0.0,
+                                        step=0.5,
+                                        label="Time Offset (seconds)",
+                                        info="Video start offset relative to GPX start (+/- sec)",
+                                        scale=2
+                                    )
+                                    btn_generate_geo = gr.Button(
+                                        "📍 Generate GEO Information",
+                                        variant="primary",
+                                        scale=2
+                                    )
+                                gis_status_md = gr.Markdown("")
+                                gis_map_html = gr.HTML(value="", label="Interactive Defect Map")
+                                gis_download_file = gr.File(label="📥 Download defects.geojson", interactive=False, visible=False)
+
                 with gr.Column(visible=True) as local_galleries_col:
                     # Gallery Section
                     gr.HTML('<div class="gallery-section"></div>')
@@ -2523,9 +4586,9 @@ def build_ui():
                         object_fit="contain"
                     )
 
-                    gr.HTML('<div class="section-header">✨ SAM2 Segmentation Results</div>')
+                    gr.HTML('<div class="section-header">✨ YOLO Segmentation Results</div>')
                     output_seg_gallery = gr.Gallery(
-                        label="Segmentation Overlays",
+                        label="YOLO Segmentation Overlays & Masks",
                         columns=4,
                         rows=2,
                         height="auto",
@@ -2551,7 +4614,7 @@ def build_ui():
                         examples=[[vid] for vid in example_videos],
                         inputs=[input_video],
                         outputs=[output_video, output_csv, output_crops_gallery, output_summary, output_charts_gallery, output_seg_gallery],
-                        fn=lambda vid: process_video(vid, available_models[0], 0.25, 0.45, 1, True, 0.65, 45),
+                        fn=lambda vid: process_video(vid, available_models[0], 0.25, 0.45, 1, True, 0.65, 45, True, 1.2, 15.0, 1200.0),
                         cache_examples=False,
                         label="Click a sample to load:"
                     )
@@ -2560,62 +4623,232 @@ def build_ui():
             # PAGE 2: Dataset Builder
             # ═══════════════════════════════════════════════
             with gr.TabItem("📦 Dataset Builder"):
-                gr.HTML('<div class="section-header">📦 Semi-Automatic Dataset Collection</div>')
-                
-                with gr.Row():
-                    btn_load_candidates = gr.Button("📥 Load Detections from Last Inspection", variant="primary", scale=3)
-                    ds_status_md = gr.Markdown("", scale=7)
+                gr.HTML('<div class="section-header">📦 RDD Ahmedabad Dataset Builder & Curation Suite</div>')
 
-                with gr.Row():
-                    # Left: Full frame adjustment
-                    with gr.Column(scale=6):
-                        ds_full_frame = gr.HTML(
-                            value='<div style="text-align:center;color:#94a3b8;padding:40px;font-family:Inter,sans-serif;">Click 📥 Load Detections to begin.</div>'
-                        )
+                with gr.Tabs():
+                    # ─── SUB-TAB 1: Collect & Stage Defects ───
+                    with gr.TabItem("➕ Collect & Stage Defects", id="tab_collect_defects"):
                         with gr.Row():
-                            ds_padding_slider = gr.Slider(
-                                minimum=0, maximum=200, value=0, step=5,
-                                label="Expand Margin Padding (px)", scale=3
+                            btn_load_candidates = gr.Button("📥 Load Detections from Last Inspection", variant="primary", scale=3)
+                            btn_add_from_image = gr.UploadButton("🖼️ Add from Image(s)", file_types=["image"], file_count="multiple", variant="secondary", scale=2)
+                            ds_status_md = gr.Markdown("", scale=5)
+
+                        # ── Container 1: Candidate Review Step ──
+                        candidate_step_box = gr.Column(visible=True, elem_classes=["ds-wizard-panel", "ds-candidate-step"])
+                        with candidate_step_box:
+                            with gr.Row():
+                                # Left: Full frame adjustment
+                                with gr.Column(scale=6):
+                                    ds_full_frame = gr.HTML(
+                                        value='<div style="text-align:center;color:#94a3b8;padding:40px;font-family:Inter,sans-serif;">Click 📥 Load Detections or 🖼️ Add from Image(s) to begin.</div>'
+                                    )
+                                    with gr.Row():
+                                        ds_padding_slider = gr.Slider(
+                                            minimum=0, maximum=200, value=0, step=5,
+                                            label="Expand Margin Padding (px)", scale=3
+                                        )
+                                        btn_reset_box = gr.Button("🔄 Reset Box", variant="secondary", scale=1)
+
+                                # Right: Info, Crop Preview & Actions
+                                with gr.Column(scale=4):
+                                    ds_crop_image = gr.Image(
+                                        label="Crop Preview (Will be staged)",
+                                        type="numpy", interactive=False, height=190,
+                                    )
+                                    
+                                    ds_progress_md = gr.Markdown("")
+                                    ds_info_md = gr.Markdown("Click **Load Detections** or upload image(s) to start.")
+
+                                    rdd_class_names = RDD_CLASS_CONFIG.get_class_names() if RDD_CLASS_CONFIG else ["POTHOLE"]
+                                    ds_class_dropdown = gr.Dropdown(
+                                        choices=rdd_class_names,
+                                        value=rdd_class_names[0] if rdd_class_names else None,
+                                        label="Assign Class",
+                                        interactive=True,
+                                    )
+
+                                    with gr.Row(elem_classes="ds-action-row"):
+                                        btn_accept = gr.Button("✅ Accept Defect", variant="primary", scale=2)
+                                        btn_add_another = gr.Button("➕ Add Another in Frame", variant="secondary", scale=2)
+                                        btn_skip = gr.Button("⏭️ Skip", variant="secondary", scale=1)
+                                    
+                                    with gr.Row(elem_classes="ds-action-row"):
+                                        btn_prev_candidate = gr.Button("⏮️ Previous", variant="secondary", scale=1)
+                                        btn_review_staged = gr.Button("📋 Review Staged (0)", variant="primary", scale=2)
+                                    
+                                    # Coordinates for manual fine-tuning and canvas sync
+                                    with gr.Row(elem_classes="ds-coords-row"):
+                                        ds_x1 = gr.Number(label="X1", value=0, precision=0, elem_id="ds_bbox_x1", scale=1)
+                                        ds_y1 = gr.Number(label="Y1", value=0, precision=0, elem_id="ds_bbox_y1", scale=1)
+                                        ds_x2 = gr.Number(label="X2", value=0, precision=0, elem_id="ds_bbox_x2", scale=1)
+                                        ds_y2 = gr.Number(label="Y2", value=0, precision=0, elem_id="ds_bbox_y2", scale=1)
+
+                        # ── Container 2: Confirmation & Review Step ──
+                        review_step_box = gr.Column(visible=False, elem_classes=["ds-wizard-panel", "ds-review-step"])
+                        with review_step_box:
+                            with gr.Row():
+                                with gr.Column(scale=6):
+                                    ds_review_prompt_md = gr.Markdown("")
+                                mantle_dist = gr.Column(scale=4)
+                                with mantle_dist:
+                                    ds_review_dist_md = gr.Markdown("")
+
+                            gr.HTML('<div class="section-header" style="margin-top:0.4rem;margin-bottom:0.4rem;">🖼️ Staged Defect Crops for Confirmation</div>')
+                            ds_review_gallery = gr.Gallery(
+                                label="Staged Defect Crops",
+                                columns=5,
+                                rows=2,
+                                height=240,
+                                object_fit="contain",
                             )
-                            btn_reset_box = gr.Button("🔄 Reset Box", variant="secondary", scale=1)
 
-                    # Right: Info, Crop Preview & Actions
-                    with gr.Column(scale=4):
-                        ds_crop_image = gr.Image(
-                            label="Crop Preview (Will be saved)",
-                            type="numpy", interactive=False, height=280,
-                        )
-                        
-                        ds_progress_md = gr.Markdown("")
-                        ds_info_md = gr.Markdown("Click **Load Detections** after running an inspection.")
+                            with gr.Accordion("✏️ Edit a Specific Defect", open=False):
+                                gr.Markdown("Select any staged defect below to adjust its crop margins, coordinates, or class before adding to the dataset:")
+                                with gr.Row():
+                                    ds_edit_selector = gr.Dropdown(
+                                        choices=[],
+                                        label="Select Defect to Edit",
+                                        scale=4,
+                                        interactive=True
+                                    )
+                                    btn_refresh_edit_list = gr.Button("🔄 Refresh List", scale=1)
 
-                        rdd_class_names = RDD_CLASS_CONFIG.get_class_names() if RDD_CLASS_CONFIG else ["POTHOLE"]
-                        ds_class_dropdown = gr.Dropdown(
-                            choices=rdd_class_names,
-                            value=rdd_class_names[0] if rdd_class_names else None,
-                            label="Assign Class",
-                            info="Change if the model prediction is incorrect",
-                            interactive=True,
-                        )
+                                with gr.Row():
+                                    with gr.Column(scale=6):
+                                        ds_edit_full_frame = gr.HTML(
+                                            value='<div style="text-align:center;color:#94a3b8;padding:20px;">Select a defect from the dropdown above to edit.</div>'
+                                        )
+                                        with gr.Row():
+                                            ds_edit_padding_slider = gr.Slider(
+                                                minimum=0, maximum=200, value=0, step=5,
+                                                label="Expand Margin Padding (px)", scale=3
+                                            )
+                                            btn_edit_reset_box = gr.Button("🔄 Reset Box", variant="secondary", scale=1)
+                                    with gr.Column(scale=4):
+                                        ds_edit_crop_image = gr.Image(
+                                            label="Crop Preview", type="numpy", interactive=False, height=200
+                                        )
+                                        ds_edit_class_dropdown = gr.Dropdown(
+                                            choices=rdd_class_names,
+                                            label="Reassign Class",
+                                            interactive=True,
+                                        )
+                                        ds_edit_status_md = gr.Markdown("")
+                                        with gr.Row():
+                                            btn_save_staged_edit = gr.Button("💾 Save Defect Changes", variant="primary", scale=2)
+                                            btn_delete_staged = gr.Button("🗑️ Remove from Batch", variant="stop", scale=2)
+                                        # Coordinates for manual fine-tuning and canvas sync
+                                        with gr.Row(elem_classes="ds-coords-row"):
+                                            ds_edit_x1 = gr.Number(label="X1", value=0, precision=0, elem_id="ds_edit_bbox_x1", scale=1)
+                                            ds_edit_y1 = gr.Number(label="Y1", value=0, precision=0, elem_id="ds_edit_bbox_y1", scale=1)
+                                            ds_edit_x2 = gr.Number(label="X2", value=0, precision=0, elem_id="ds_edit_bbox_x2", scale=1)
+                                            ds_edit_y2 = gr.Number(label="Y2", value=0, precision=0, elem_id="ds_edit_bbox_y2", scale=1)
+
+                            gr.HTML('<div class="styled-divider"></div>')
+                            with gr.Row():
+                                btn_confirm_dataset = gr.Button(
+                                    "💾 Confirm & Add to RDD_Ahmedabad Dataset",
+                                    variant="primary",
+                                    scale=4,
+                                )
+                                btn_back_to_candidates = gr.Button("↩️ Back to Candidate Review", variant="secondary", scale=2)
+                                btn_discard_batch = gr.Button("🗑️ Discard Batch", variant="stop", scale=1)
+
+                        ds_commit_result_md = gr.Markdown("", visible=False)
+
+                    # ─── SUB-TAB 2: Revive & Curate RDD_Ahmedabad Dataset ───
+                    with gr.TabItem("🛠️ Revive & Curate Dataset", id="tab_curate_dataset"):
+                        gr.HTML('<div class="section-header" style="font-size:0.95rem;margin-bottom:0.5rem;">🔍 Inspect, Repair Crops, Reclassify, or Clean Defect Annotations in RDD_Ahmedabad</div>')
+
+                        curate_class_choices = get_curate_class_choices()
+                        initial_jump_choices = load_curate_dataset()
+
+                        with gr.Row():
+                            curate_class_filter = gr.Dropdown(
+                                choices=curate_class_choices,
+                                value="ALL",
+                                label="Filter by Defect Class",
+                                scale=3,
+                                interactive=True
+                            )
+                            curate_split_filter = gr.Dropdown(
+                                choices=["ALL", "train", "val", "test"],
+                                value="ALL",
+                                label="Filter by Split",
+                                scale=2,
+                                interactive=True
+                            )
+                            curate_search_input = gr.Textbox(
+                                label="Search Image / Video",
+                                placeholder="Search filename (e.g. road_footage_7)...",
+                                scale=3,
+                                interactive=True
+                            )
+                            btn_curate_filter_apply = gr.Button("🔍 Apply Filter", variant="secondary", scale=1)
+                            btn_curate_refresh = gr.Button("🔄 Refresh", variant="secondary", scale=1)
 
                         with gr.Row(elem_classes="ds-action-row"):
-                            btn_accept = gr.Button("✅ Accept & Save", variant="primary", scale=2)
-                            btn_add_another = gr.Button("➕ Add Another in Frame", variant="secondary", scale=2)
-                            btn_skip = gr.Button("⏭️ Skip", variant="secondary", scale=1)
-                        
-                        # Hidden coordinates for JS sync (dynamically applies bounding box changes)
-                        with gr.Row(visible=False):
-                            ds_x1 = gr.Number(label="X1", value=0, elem_id="ds_bbox_x1")
-                            ds_y1 = gr.Number(label="Y1", value=0, elem_id="ds_bbox_y1")
-                            ds_x2 = gr.Number(label="X2", value=0, elem_id="ds_bbox_x2")
-                            ds_y2 = gr.Number(label="Y2", value=0, elem_id="ds_bbox_y2")
+                            btn_curate_prev = gr.Button("⏮️ Previous Defect", variant="secondary", scale=2)
+                            curate_jump_dropdown = gr.Dropdown(
+                                choices=initial_jump_choices,
+                                value=0 if initial_jump_choices else None,
+                                label="Jump to Defect in Filtered Set",
+                                scale=5,
+                                interactive=True
+                            )
+                            btn_curate_next = gr.Button("⏭️ Next Defect", variant="secondary", scale=2)
+                            btn_curate_random = gr.Button("🎲 Random", variant="secondary", scale=1)
+
+                        curate_pos_indicator_md = gr.Markdown(
+                            value=f"📍 Defect **1** of **{len(initial_jump_choices)}** · Filtered Total: **{len(initial_jump_choices)}**" if initial_jump_choices else "No defects loaded."
+                        )
+
+                        # ── Curate Workbench Panels ──
+                        curate_workbench_box = gr.Row(elem_classes=["ds-wizard-panel", "ds-curate-step"])
+                        with curate_workbench_box:
+                            # Left Column: Canvas Bbox Editor & Margin Padding
+                            with gr.Column(scale=6):
+                                curate_full_frame = gr.HTML(
+                                    value='<div style="text-align:center;color:#94a3b8;padding:40px;">Select a defect above or click Apply Filter to inspect.</div>'
+                                )
+                                with gr.Row():
+                                    curate_padding_slider = gr.Slider(
+                                        minimum=0, maximum=200, value=0, step=5,
+                                        label="Expand Margin Padding (px)", scale=3
+                                    )
+                                    btn_curate_reset_box = gr.Button("🔄 Reset Box", variant="secondary", scale=1)
+
+                            # Right Column: Crop Preview, Info Card, Class Reassign & Save/Delete
+                            with gr.Column(scale=4):
+                                curate_crop_image = gr.Image(
+                                    label="Defect Crop Preview",
+                                    type="numpy", interactive=False, height=200
+                                )
+                                curate_info_md = gr.Markdown("")
+                                curate_class_dropdown = gr.Dropdown(
+                                    choices=rdd_class_names,
+                                    value=rdd_class_names[0] if rdd_class_names else None,
+                                    label="Reassign Defect Class",
+                                    interactive=True,
+                                )
+                                curate_status_md = gr.Markdown("")
+                                with gr.Row(elem_classes="ds-action-row"):
+                                    btn_curate_save = gr.Button("💾 Save Defect Changes", variant="primary", scale=2)
+                                    btn_curate_delete = gr.Button("🗑️ Delete Defect", variant="stop", scale=2)
+
+                                # Synchronized coordinates
+                                with gr.Row(elem_classes="ds-coords-row"):
+                                    curate_x1 = gr.Number(label="X1", value=0, precision=0, elem_id="ds_curate_bbox_x1", scale=1)
+                                    curate_y1 = gr.Number(label="Y1", value=0, precision=0, elem_id="ds_curate_bbox_y1", scale=1)
+                                    curate_x2 = gr.Number(label="X2", value=0, precision=0, elem_id="ds_curate_bbox_x2", scale=1)
+                                    curate_y2 = gr.Number(label="Y2", value=0, precision=0, elem_id="ds_curate_bbox_y2", scale=1)
 
                 gr.HTML('<div class="styled-divider"></div>')
-                gr.HTML('<div class="section-header">📊 Dataset Statistics</div>')
-                ds_stats_md = gr.Markdown(
-                    value=get_dataset_stats_md()
-                )
-                btn_refresh_stats = gr.Button("🔄 Refresh Stats")
+                with gr.Accordion("📊 Dataset Statistics (RDD_Ahmedabad)", open=False):
+                    ds_stats_md = gr.Markdown(
+                        value=get_dataset_stats_md()
+                    )
+                    btn_refresh_stats = gr.Button("🔄 Refresh Stats")
 
             # ═══════════════════════════════════════════════
             # PAGE 3: History & Reports
@@ -2646,11 +4879,58 @@ def build_ui():
                     with gr.Column(scale=6):
                         hist_summary = gr.Markdown("Select a run from the dropdown to view its inspection report.")
 
+                        # ── History Geolocation & GIS Map Enrichment Section ──
+                        with gr.Accordion("🗺️ Geolocation & GIS Map Enrichment", open=True) as hist_gis_accordion:
+                            gr.HTML('<div style="font-size:0.88rem; color:#94a3b8; margin-bottom:8px;">Synchronize past inspection defects with GPX survey trackpoints to generate GeoJSON and view the interactive map.</div>')
+                            with gr.Row():
+                                hist_gis_gpx_upload = gr.File(
+                                    label="Upload GPX Survey Track (.gpx)",
+                                    file_types=[".gpx"],
+                                    file_count="single",
+                                    interactive=True,
+                                    scale=3
+                                )
+                                hist_gis_gpx_dropdown = gr.Dropdown(
+                                    choices=example_gpx_files,
+                                    value=example_gpx_files[0] if example_gpx_files else None,
+                                    label="📁 Quick Select GPX from inputs/",
+                                    info="Pick existing GPX survey log",
+                                    scale=3
+                                )
+                                btn_hist_refresh_gpx = gr.Button("🔄", scale=1, min_width=48)
+                            with gr.Row():
+                                hist_gis_offset_slider = gr.Slider(
+                                    minimum=-30.0,
+                                    maximum=30.0,
+                                    value=0.0,
+                                    step=0.5,
+                                    label="Time Offset (seconds)",
+                                    info="Video start offset relative to GPX start (+/- sec)",
+                                    scale=2
+                                )
+                                btn_hist_generate_geo = gr.Button(
+                                    "📍 Generate GEO Information",
+                                    variant="primary",
+                                    scale=2
+                                )
+                            hist_gis_status_md = gr.Markdown("")
+                            hist_gis_map_html = gr.HTML(value="", label="Interactive Defect Map")
+                            hist_gis_download_file = gr.File(label="📥 Download defects.geojson", interactive=False, visible=False)
+
                 gr.HTML('<div class="gallery-section"></div>')
                 gr.HTML('<div class="section-header">🖼️ Defect Crops from Selected Run</div>')
                 hist_crops_gallery = gr.Gallery(
                     label="Saved crop patches from past run",
                     columns=6,
+                    rows=2,
+                    height="auto",
+                    object_fit="contain"
+                )
+
+                gr.HTML('<div class="section-header">✨ SAM2 Segmentation Results</div>')
+                hist_seg_gallery = gr.Gallery(
+                    label="Segmentation Overlays",
+                    columns=4,
                     rows=2,
                     height="auto",
                     object_fit="contain"
@@ -2727,7 +5007,7 @@ def build_ui():
 
         btn_process_cloud_event = btn_process_cloud.click(
             fn=process_video_cloud,
-            inputs=[input_video, model_selector, cloud_url_input],
+            inputs=[input_video, model_selector, cloud_url_input, enable_seg_ui],
             outputs=[
                 cloud_output_file,
                 output_video, output_csv, output_crops_gallery, output_summary, output_charts_gallery, output_seg_gallery
@@ -2756,7 +5036,9 @@ def build_ui():
         btn_process_event = btn_process.click(
             fn=process_video,
             inputs=[input_video, model_selector, conf_slider, iou_slider, frame_skip_slider,
-                    enable_dedup, merge_threshold_slider, track_buffer_slider],
+                    enable_dedup, merge_threshold_slider, track_buffer_slider, enable_seg_ui,
+                    cam_height_slider, cam_tilt_slider, cam_focal_slider,
+                    *class_sliders],
             outputs=[output_video, output_csv, output_crops_gallery, output_summary, output_charts_gallery, output_seg_gallery]
         )
 
@@ -2767,14 +5049,45 @@ def build_ui():
             cancels=[btn_process_event]
         )
 
+        # ── Per-Class Confidence Dynamic Sliders Event Handlers ──
+        model_selector.change(
+            fn=on_model_selection_change,
+            inputs=[model_selector, conf_slider],
+            outputs=[per_class_info_md, *class_sliders]
+        )
+
+        btn_sync_all_conf.click(
+            fn=sync_all_class_sliders,
+            inputs=[model_selector, conf_slider],
+            outputs=class_sliders
+        )
+
+        btn_reset_all_conf.click(
+            fn=lambda m: sync_all_class_sliders(m, 0.25),
+            inputs=[model_selector],
+            outputs=class_sliders
+        )
+
+        # OpenVINO Model Toggle Event Handler
+        openvino_toggle.change(
+            fn=on_toggle_openvino,
+            inputs=[openvino_toggle],
+            outputs=[model_selector]
+        ).then(
+            fn=on_model_selection_change,
+            inputs=[model_selector, conf_slider],
+            outputs=[per_class_info_md, *class_sliders]
+        )
+
         # Model Refresh Event Handler
         btn_refresh_models.click(
-            fn=lambda: gr.Dropdown(
-                choices=get_available_models(),
-                value=get_available_models()[0] if get_available_models() else None
-            ),
-            inputs=[],
+            fn=on_toggle_openvino,
+            inputs=[openvino_toggle],
             outputs=[model_selector]
+        ).then(
+            fn=on_model_selection_change,
+            inputs=[model_selector, conf_slider],
+            outputs=[per_class_info_md, *class_sliders]
         )
 
         # Dedup Toggle Event Handler
@@ -2782,6 +5095,34 @@ def build_ui():
             fn=on_toggle_dedup,
             inputs=[enable_dedup],
             outputs=[dedup_status_md, btn_process, dedup_params_row]
+        )
+
+        # Quick Sample Selector Event Handlers
+        quick_sample_dd.change(
+            fn=lambda v: v,
+            inputs=[quick_sample_dd],
+            outputs=[input_video]
+        )
+        btn_refresh_samples.click(
+            fn=lambda: gr.Dropdown(choices=get_example_videos(), value=None),
+            inputs=[],
+            outputs=[quick_sample_dd]
+        )
+
+        # ── GIS Geolocation Enrichment Event Handlers (New Inspection Tab) ──
+        btn_refresh_gpx.click(
+            fn=lambda: gr.Dropdown(
+                choices=get_example_gpx_files(),
+                value=get_example_gpx_files()[0] if get_example_gpx_files() else None
+            ),
+            inputs=[],
+            outputs=[gis_gpx_dropdown]
+        )
+
+        btn_generate_geo.click(
+            fn=on_generate_geo,
+            inputs=[gis_gpx_upload, gis_gpx_dropdown, gis_offset_slider],
+            outputs=[gis_status_md, gis_map_html, gis_download_file]
         )
 
         # Video Estimation Event Handlers
@@ -2796,11 +5137,14 @@ def build_ui():
             outputs=[video_est_md]
         )
 
-        # History Page Event Handlers
+        # ── History Page Event Handlers ──
         history_selector.change(
             fn=load_history_details,
             inputs=[history_selector],
-            outputs=[hist_video, hist_csv, hist_crops_gallery, hist_summary, hist_charts_gallery]
+            outputs=[
+                hist_video, hist_csv, hist_crops_gallery, hist_summary, hist_charts_gallery, hist_seg_gallery,
+                hist_gis_status_md, hist_gis_map_html, hist_gis_download_file
+            ]
         )
 
         btn_refresh_history.click(
@@ -2812,85 +5156,402 @@ def build_ui():
             outputs=[history_selector]
         )
 
+        # ── History GIS Geolocation Enrichment Event Handlers ──
+        btn_hist_refresh_gpx.click(
+            fn=lambda: gr.Dropdown(
+                choices=get_example_gpx_files(),
+                value=get_example_gpx_files()[0] if get_example_gpx_files() else None
+            ),
+            inputs=[],
+            outputs=[hist_gis_gpx_dropdown]
+        )
+
+        btn_hist_generate_geo.click(
+            fn=on_generate_geo_history,
+            inputs=[history_selector, hist_gis_gpx_upload, hist_gis_gpx_dropdown, hist_gis_offset_slider],
+            outputs=[hist_gis_status_md, hist_gis_map_html, hist_gis_download_file]
+        )
+
+        if history_runs:
+            demo.load(
+                fn=load_history_details,
+                inputs=[history_selector],
+                outputs=[
+                    hist_video, hist_csv, hist_crops_gallery, hist_summary, hist_charts_gallery, hist_seg_gallery,
+                    hist_gis_status_md, hist_gis_map_html, hist_gis_download_file
+                ]
+            )
+
         # ── Dataset Builder Event Handlers ──
 
         def _on_load_candidates():
             msg, count = prepare_annotation_candidates()
             if count > 0:
                 crop_img, info, suggested, progress, is_done = get_current_candidate_display()
-                # Also load the full frame overlay for adjustment panel
                 frame_overlay, x1, y1, x2, y2 = get_full_frame_with_overlay()
                 return (
-                    msg, crop_img, info, progress, gr.Dropdown(value=suggested),
-                    frame_overlay, x1, y1, x2, y2, 0
+                    msg,
+                    gr.Column(visible=True),   # candidate_step_box
+                    gr.Column(visible=False),  # review_step_box
+                    gr.Markdown(value="", visible=False),  # ds_commit_result_md
+                    crop_img, info, progress, gr.Dropdown(value=suggested),
+                    frame_overlay, x1, y1, x2, y2, 0,
+                    gr.Button(value="📋 Review Staged (0)")
                 )
             return (
-                msg, None, "No candidates available.", "", gr.Dropdown(),
-                None, 0, 0, 0, 0, 0
+                msg,
+                gr.Column(visible=True),
+                gr.Column(visible=False),
+                gr.Markdown(value="", visible=False),
+                None, "No candidates available.", "", gr.Dropdown(),
+                None, 0, 0, 0, 0, 0,
+                gr.Button(value="📋 Review Staged (0)")
             )
 
         btn_load_candidates.click(
             fn=_on_load_candidates,
             inputs=[],
             outputs=[
-                ds_status_md, ds_crop_image, ds_info_md, ds_progress_md, ds_class_dropdown,
-                ds_full_frame, ds_x1, ds_y1, ds_x2, ds_y2, ds_padding_slider
+                ds_status_md, candidate_step_box, review_step_box, ds_commit_result_md,
+                ds_crop_image, ds_info_md, ds_progress_md, ds_class_dropdown,
+                ds_full_frame, ds_x1, ds_y1, ds_x2, ds_y2, ds_padding_slider, btn_review_staged
             ]
         )
 
-        def _on_accept(chosen_class):
-            crop_img, info, suggested, progress, is_done = accept_annotation(chosen_class)
-            stats = get_dataset_stats_md()
-            # Load frame overlay for the next candidate
-            frame_overlay, x1, y1, x2, y2 = get_full_frame_with_overlay()
+        def _on_add_from_image(image_file):
+            msg, count = prepare_image_annotation_candidates(image_file)
+            staged = _ANNOTATION_STATE.get("staged_defects", [])
+            staged_btn_label = f"📋 Review Staged ({len(staged)})"
+            if count > 0:
+                crop_img, info, suggested, progress, is_done = get_current_candidate_display()
+                frame_overlay, x1, y1, x2, y2 = get_full_frame_with_overlay()
+                return (
+                    msg,
+                    gr.Column(visible=True),   # candidate_step_box
+                    gr.Column(visible=False),  # review_step_box
+                    gr.Markdown(value="", visible=False),  # ds_commit_result_md
+                    crop_img, info, progress, gr.Dropdown(value=suggested),
+                    frame_overlay, x1, y1, x2, y2, 0,
+                    gr.Button(value=staged_btn_label)
+                )
             return (
-                crop_img, info, progress, gr.Dropdown(value=suggested), stats,
-                frame_overlay, x1, y1, x2, y2, 0
+                msg,
+                gr.Column(visible=True),
+                gr.Column(visible=False),
+                gr.Markdown(value="", visible=False),
+                None, "Failed to load image.", "", gr.Dropdown(),
+                None, 0, 0, 0, 0, 0,
+                gr.Button(value=staged_btn_label)
             )
+
+        btn_add_from_image.upload(
+            fn=_on_add_from_image,
+            inputs=[btn_add_from_image],
+            outputs=[
+                ds_status_md, candidate_step_box, review_step_box, ds_commit_result_md,
+                ds_crop_image, ds_info_md, ds_progress_md, ds_class_dropdown,
+                ds_full_frame, ds_x1, ds_y1, ds_x2, ds_y2, ds_padding_slider, btn_review_staged
+            ]
+        )
+
+        def _on_accept(chosen_class, x1, y1, x2, y2):
+            try:
+                coords = (int(x1), int(y1), int(x2), int(y2))
+            except (ValueError, TypeError):
+                coords = None
+            stage_candidate_annotation(chosen_class, bbox=coords)
+            candidates = _ANNOTATION_STATE.get("candidates", [])
+            idx = _ANNOTATION_STATE.get("current_index", 0)
+            staged = _ANNOTATION_STATE.get("staged_defects", [])
+            
+            if idx >= len(candidates):
+                # Completed last defect! Switch automatically to Confirmation & Review step
+                prompt_md, dist_md, gallery_items, choices = get_staged_review_data()
+                return (
+                    gr.Column(visible=False),  # candidate_step_box
+                    gr.Column(visible=True),   # review_step_box
+                    None,                      # ds_crop_image
+                    "All candidates reviewed.",# ds_info_md
+                    f"Review Complete — Staged: {len(staged)}", # ds_progress_md
+                    gr.Dropdown(),             # ds_class_dropdown
+                    None, 0, 0, 0, 0, 0,       # ds_full_frame, x1, y1, x2, y2, padding
+                    gr.Button(value=f"📋 Review Staged ({len(staged)})"),
+                    prompt_md, dist_md, gallery_items,
+                    gr.Dropdown(choices=choices, value=choices[0] if choices else None)
+                )
+            else:
+                crop_img, info, suggested, progress, is_done = get_current_candidate_display()
+                frame_overlay, rx1, ry1, rx2, ry2 = get_full_frame_with_overlay()
+                return (
+                    gr.Column(visible=True),
+                    gr.Column(visible=False),
+                    crop_img, info, progress, gr.Dropdown(value=suggested),
+                    frame_overlay, rx1, ry1, rx2, ry2, 0,
+                    gr.Button(value=f"📋 Review Staged ({len(staged)})"),
+                    "", "", [], gr.Dropdown()
+                )
 
         btn_accept.click(
             fn=_on_accept,
-            inputs=[ds_class_dropdown],
+            inputs=[ds_class_dropdown, ds_x1, ds_y1, ds_x2, ds_y2],
             outputs=[
-                ds_crop_image, ds_info_md, ds_progress_md, ds_class_dropdown, ds_stats_md,
-                ds_full_frame, ds_x1, ds_y1, ds_x2, ds_y2, ds_padding_slider
+                candidate_step_box, review_step_box,
+                ds_crop_image, ds_info_md, ds_progress_md, ds_class_dropdown,
+                ds_full_frame, ds_x1, ds_y1, ds_x2, ds_y2, ds_padding_slider, btn_review_staged,
+                ds_review_prompt_md, ds_review_dist_md, ds_review_gallery, ds_edit_selector
             ]
         )
 
-        def _on_add_another(chosen_class):
-            crop_img, info, suggested, progress, is_done = add_another_defect_annotation(chosen_class)
-            stats = get_dataset_stats_md()
-            # We don't advance, so reload the same frame overlay
-            frame_overlay, x1, y1, x2, y2 = get_full_frame_with_overlay()
+        def _on_add_another(chosen_class, x1, y1, x2, y2):
+            try:
+                coords = (int(x1), int(y1), int(x2), int(y2))
+            except (ValueError, TypeError):
+                coords = None
+            stage_another_defect_annotation(chosen_class, bbox=coords)
+            staged = _ANNOTATION_STATE.get("staged_defects", [])
+            crop_img, info, suggested, progress, is_done = get_current_candidate_display()
+            frame_overlay, rx1, ry1, rx2, ry2 = get_full_frame_with_overlay()
             return (
-                crop_img, info, progress, gr.Dropdown(value=suggested), stats,
-                frame_overlay, x1, y1, x2, y2, 0
+                crop_img, info, progress, gr.Dropdown(value=suggested),
+                frame_overlay, rx1, ry1, rx2, ry2, 0,
+                gr.Button(value=f"📋 Review Staged ({len(staged)})")
             )
 
         btn_add_another.click(
             fn=_on_add_another,
-            inputs=[ds_class_dropdown],
+            inputs=[ds_class_dropdown, ds_x1, ds_y1, ds_x2, ds_y2],
             outputs=[
-                ds_crop_image, ds_info_md, ds_progress_md, ds_class_dropdown, ds_stats_md,
-                ds_full_frame, ds_x1, ds_y1, ds_x2, ds_y2, ds_padding_slider
+                ds_crop_image, ds_info_md, ds_progress_md, ds_class_dropdown,
+                ds_full_frame, ds_x1, ds_y1, ds_x2, ds_y2, ds_padding_slider, btn_review_staged
             ]
         )
 
         def _on_skip():
-            crop_img, info, suggested, progress, is_done = skip_annotation()
-            # Load frame overlay for the next candidate
-            frame_overlay, x1, y1, x2, y2 = get_full_frame_with_overlay()
-            return (
-                crop_img, info, progress, gr.Dropdown(value=suggested),
-                frame_overlay, x1, y1, x2, y2, 0
-            )
+            skip_annotation()
+            candidates = _ANNOTATION_STATE.get("candidates", [])
+            idx = _ANNOTATION_STATE.get("current_index", 0)
+            staged = _ANNOTATION_STATE.get("staged_defects", [])
+
+            if idx >= len(candidates):
+                prompt_md, dist_md, gallery_items, choices = get_staged_review_data()
+                return (
+                    gr.Column(visible=False),
+                    gr.Column(visible=True),
+                    None, "All candidates reviewed.", f"Review Complete — Staged: {len(staged)}", gr.Dropdown(),
+                    None, 0, 0, 0, 0, 0,
+                    gr.Button(value=f"📋 Review Staged ({len(staged)})"),
+                    prompt_md, dist_md, gallery_items,
+                    gr.Dropdown(choices=choices, value=choices[0] if choices else None)
+                )
+            else:
+                crop_img, info, suggested, progress, is_done = get_current_candidate_display()
+                frame_overlay, x1, y1, x2, y2 = get_full_frame_with_overlay()
+                return (
+                    gr.Column(visible=True),
+                    gr.Column(visible=False),
+                    crop_img, info, progress, gr.Dropdown(value=suggested),
+                    frame_overlay, x1, y1, x2, y2, 0,
+                    gr.Button(value=f"📋 Review Staged ({len(staged)})"),
+                    "", "", [], gr.Dropdown()
+                )
 
         btn_skip.click(
             fn=_on_skip,
             inputs=[],
             outputs=[
+                candidate_step_box, review_step_box,
                 ds_crop_image, ds_info_md, ds_progress_md, ds_class_dropdown,
-                ds_full_frame, ds_x1, ds_y1, ds_x2, ds_y2, ds_padding_slider
+                ds_full_frame, ds_x1, ds_y1, ds_x2, ds_y2, ds_padding_slider, btn_review_staged,
+                ds_review_prompt_md, ds_review_dist_md, ds_review_gallery, ds_edit_selector
+            ]
+        )
+
+        def _on_prev_candidate():
+            previous_annotation()
+            staged = _ANNOTATION_STATE.get("staged_defects", [])
+            crop_img, info, suggested, progress, is_done = get_current_candidate_display()
+            frame_overlay, x1, y1, x2, y2 = get_full_frame_with_overlay()
+            return (
+                crop_img, info, progress, gr.Dropdown(value=suggested),
+                frame_overlay, x1, y1, x2, y2, 0,
+                gr.Button(value=f"📋 Review Staged ({len(staged)})")
+            )
+
+        btn_prev_candidate.click(
+            fn=_on_prev_candidate,
+            inputs=[],
+            outputs=[
+                ds_crop_image, ds_info_md, ds_progress_md, ds_class_dropdown,
+                ds_full_frame, ds_x1, ds_y1, ds_x2, ds_y2, ds_padding_slider, btn_review_staged
+            ]
+        )
+
+        def _on_go_to_review():
+            prompt_md, dist_md, gallery_items, choices = get_staged_review_data()
+            return (
+                gr.Column(visible=False),  # candidate_step_box
+                gr.Column(visible=True),   # review_step_box
+                prompt_md, dist_md, gallery_items,
+                gr.Dropdown(choices=choices, value=choices[0] if choices else None)
+            )
+
+        btn_review_staged.click(
+            fn=_on_go_to_review,
+            inputs=[],
+            outputs=[
+                candidate_step_box, review_step_box,
+                ds_review_prompt_md, ds_review_dist_md, ds_review_gallery, ds_edit_selector
+            ]
+        )
+
+        def _on_back_to_candidates():
+            staged = _ANNOTATION_STATE.get("staged_defects", [])
+            crop_img, info, suggested, progress, is_done = get_current_candidate_display()
+            frame_overlay, x1, y1, x2, y2 = get_full_frame_with_overlay()
+            return (
+                gr.Column(visible=True),
+                gr.Column(visible=False),
+                crop_img, info, progress, gr.Dropdown(value=suggested),
+                frame_overlay, x1, y1, x2, y2, 0,
+                gr.Button(value=f"📋 Review Staged ({len(staged)})")
+            )
+
+        btn_back_to_candidates.click(
+            fn=_on_back_to_candidates,
+            inputs=[],
+            outputs=[
+                candidate_step_box, review_step_box,
+                ds_crop_image, ds_info_md, ds_progress_md, ds_class_dropdown,
+                ds_full_frame, ds_x1, ds_y1, ds_x2, ds_y2, ds_padding_slider, btn_review_staged
+            ]
+        )
+
+        # ── Staged Defect Edit Handlers ──
+
+        def _on_select_edit(selected_label):
+            return select_staged_defect_for_edit(selected_label)
+
+        ds_edit_selector.change(
+            fn=_on_select_edit,
+            inputs=[ds_edit_selector],
+            outputs=[
+                ds_edit_crop_image, ds_edit_full_frame, ds_edit_class_dropdown,
+                ds_edit_padding_slider, ds_edit_x1, ds_edit_y1, ds_edit_x2, ds_edit_y2,
+                ds_edit_status_md
+            ]
+        )
+
+        def _on_refresh_edit_list():
+            prompt_md, dist_md, gallery_items, choices = get_staged_review_data()
+            return prompt_md, dist_md, gallery_items, gr.Dropdown(choices=choices, value=choices[0] if choices else None)
+
+        btn_refresh_edit_list.click(
+            fn=_on_refresh_edit_list,
+            inputs=[],
+            outputs=[ds_review_prompt_md, ds_review_dist_md, ds_review_gallery, ds_edit_selector]
+        )
+
+        def _on_edit_padding_change(pad):
+            crop_rgb, html, x1, y1, x2, y2 = adjust_staged_bbox_padding(pad)
+            return crop_rgb, html, x1, y1, x2, y2
+
+        ds_edit_padding_slider.change(
+            fn=_on_edit_padding_change,
+            inputs=[ds_edit_padding_slider],
+            outputs=[ds_edit_crop_image, ds_edit_full_frame, ds_edit_x1, ds_edit_y1, ds_edit_x2, ds_edit_y2]
+        )
+
+        def _on_edit_coords_change(x1, y1, x2, y2):
+            crop_rgb, html = apply_staged_bbox_coords(x1, y1, x2, y2)
+            return crop_rgb, html
+
+        gr.on(
+            triggers=[ds_edit_x1.change, ds_edit_y1.change, ds_edit_x2.change, ds_edit_y2.change],
+            fn=_on_edit_coords_change,
+            inputs=[ds_edit_x1, ds_edit_y1, ds_edit_x2, ds_edit_y2],
+            outputs=[ds_edit_crop_image, ds_edit_full_frame]
+        )
+
+        def _on_edit_reset_box():
+            crop_rgb, html, x1, y1, x2, y2, pad = reset_staged_bbox_to_original()
+            return crop_rgb, html, x1, y1, x2, y2, pad
+
+        btn_edit_reset_box.click(
+            fn=_on_edit_reset_box,
+            inputs=[],
+            outputs=[
+                ds_edit_crop_image, ds_edit_full_frame,
+                ds_edit_x1, ds_edit_y1, ds_edit_x2, ds_edit_y2, ds_edit_padding_slider
+            ]
+        )
+
+        def _on_save_staged_edit(chosen_class, x1, y1, x2, y2):
+            try:
+                coords = (int(x1), int(y1), int(x2), int(y2))
+            except (ValueError, TypeError):
+                coords = None
+            return save_staged_defect_changes(chosen_class, bbox=coords)
+
+        btn_save_staged_edit.click(
+            fn=_on_save_staged_edit,
+            inputs=[ds_edit_class_dropdown, ds_edit_x1, ds_edit_y1, ds_edit_x2, ds_edit_y2],
+            outputs=[
+                ds_review_prompt_md, ds_review_dist_md, ds_review_gallery,
+                ds_edit_selector, ds_edit_status_md
+            ]
+        )
+
+        def _on_delete_staged():
+            return delete_staged_defect()
+
+        btn_delete_staged.click(
+            fn=_on_delete_staged,
+            inputs=[],
+            outputs=[
+                ds_review_prompt_md, ds_review_dist_md, ds_review_gallery, ds_edit_selector,
+                ds_edit_crop_image, ds_edit_full_frame, ds_edit_class_dropdown,
+                ds_edit_padding_slider, ds_edit_x1, ds_edit_y1, ds_edit_x2, ds_edit_y2,
+                ds_edit_status_md
+            ]
+        )
+
+        # ── Final Confirmation & Commit Handlers ──
+
+        def _on_confirm_dataset():
+            success_md, stats_md, review_visible = commit_staged_defects_to_dataset()
+            return (
+                gr.Markdown(value=success_md, visible=True),  # ds_commit_result_md
+                stats_md,                                     # ds_stats_md
+                gr.Column(visible=False),                     # review_step_box
+                gr.Column(visible=False),                     # candidate_step_box
+                "✅ Successfully committed defects to RDD_Ahmedabad dataset!" # ds_status_md
+            )
+
+        btn_confirm_dataset.click(
+            fn=_on_confirm_dataset,
+            inputs=[],
+            outputs=[
+                ds_commit_result_md, ds_stats_md, review_step_box, candidate_step_box, ds_status_md
+            ]
+        )
+
+        def _on_discard_batch():
+            msg = discard_staged_batch()
+            return (
+                msg,                       # ds_status_md
+                gr.Column(visible=True),   # candidate_step_box
+                gr.Column(visible=False),  # review_step_box
+                gr.Markdown(value="", visible=False), # ds_commit_result_md
+                None, "Batch discarded. Click Load Detections to start a new session.", "",
+                None, gr.Button(value="📋 Review Staged (0)")
+            )
+
+        btn_discard_batch.click(
+            fn=_on_discard_batch,
+            inputs=[],
+            outputs=[
+                ds_status_md, candidate_step_box, review_step_box, ds_commit_result_md,
+                ds_crop_image, ds_info_md, ds_progress_md, ds_full_frame, btn_review_staged
             ]
         )
 
@@ -2939,19 +5600,258 @@ def build_ui():
             ]
         )
 
+        # ── Dataset Curation & Revival Event Handlers ──
+
+        def _on_curate_filter(class_filter, split_filter, search_term):
+            """Apply filters to dataset and reload defect view from position 0."""
+            choices = load_curate_dataset(class_filter, split_filter, search_term)
+            crop_rgb, html, info_md, cname, x1, y1, x2, y2, pad, pos_badge, pos, status_md = get_curate_defect_display(0)
+            dropdown_val = 0 if choices else None
+            return (
+                crop_rgb, html, info_md, cname,
+                x1, y1, x2, y2, pad, pos_badge,
+                gr.Dropdown(choices=choices, value=dropdown_val),
+                status_md
+            )
+
+        btn_curate_filter_apply.click(
+            fn=_on_curate_filter,
+            inputs=[curate_class_filter, curate_split_filter, curate_search_input],
+            outputs=[
+                curate_crop_image, curate_full_frame, curate_info_md, curate_class_dropdown,
+                curate_x1, curate_y1, curate_x2, curate_y2, curate_padding_slider,
+                curate_pos_indicator_md, curate_jump_dropdown, curate_status_md
+            ]
+        )
+
+        def _on_curate_refresh():
+            """Refresh annotations from disk, update class filter choices and reload view."""
+            curate_classes = get_curate_class_choices()
+            choices = load_curate_dataset("ALL", "ALL", "")
+            crop_rgb, html, info_md, cname, x1, y1, x2, y2, pad, pos_badge, pos, status_md = get_curate_defect_display(0)
+            dropdown_val = 0 if choices else None
+            return (
+                gr.Dropdown(choices=curate_classes, value="ALL"),
+                gr.Dropdown(value="ALL"),
+                "",
+                crop_rgb, html, info_md, cname,
+                x1, y1, x2, y2, pad, pos_badge,
+                gr.Dropdown(choices=choices, value=dropdown_val),
+                status_md,
+                get_dataset_stats_md()
+            )
+
+        btn_curate_refresh.click(
+            fn=_on_curate_refresh,
+            inputs=[],
+            outputs=[
+                curate_class_filter, curate_split_filter, curate_search_input,
+                curate_crop_image, curate_full_frame, curate_info_md, curate_class_dropdown,
+                curate_x1, curate_y1, curate_x2, curate_y2, curate_padding_slider,
+                curate_pos_indicator_md, curate_jump_dropdown, curate_status_md,
+                ds_stats_md
+            ]
+        )
+
+        def _on_curate_jump(pos):
+            """Jump to defect selected in dropdown."""
+            if pos is None:
+                pos = 0
+            crop_rgb, html, info_md, cname, x1, y1, x2, y2, pad, pos_badge, pos_idx, status_md = get_curate_defect_display(pos)
+            return (
+                crop_rgb, html, info_md, cname,
+                x1, y1, x2, y2, pad, pos_badge,
+                pos_idx, status_md
+            )
+
+        curate_jump_dropdown.change(
+            fn=_on_curate_jump,
+            inputs=[curate_jump_dropdown],
+            outputs=[
+                curate_crop_image, curate_full_frame, curate_info_md, curate_class_dropdown,
+                curate_x1, curate_y1, curate_x2, curate_y2, curate_padding_slider,
+                curate_pos_indicator_md, curate_jump_dropdown, curate_status_md
+            ]
+        )
+
+        def _on_curate_prev():
+            cur_pos = _CURATE_STATE.get("current_pos", 0)
+            target = cur_pos - 1
+            crop_rgb, html, info_md, cname, x1, y1, x2, y2, pad, pos_badge, pos_idx, status_md = get_curate_defect_display(target)
+            return (
+                crop_rgb, html, info_md, cname,
+                x1, y1, x2, y2, pad, pos_badge,
+                pos_idx, status_md
+            )
+
+        btn_curate_prev.click(
+            fn=_on_curate_prev,
+            inputs=[],
+            outputs=[
+                curate_crop_image, curate_full_frame, curate_info_md, curate_class_dropdown,
+                curate_x1, curate_y1, curate_x2, curate_y2, curate_padding_slider,
+                curate_pos_indicator_md, curate_jump_dropdown, curate_status_md
+            ]
+        )
+
+        def _on_curate_next():
+            cur_pos = _CURATE_STATE.get("current_pos", 0)
+            target = cur_pos + 1
+            crop_rgb, html, info_md, cname, x1, y1, x2, y2, pad, pos_badge, pos_idx, status_md = get_curate_defect_display(target)
+            return (
+                crop_rgb, html, info_md, cname,
+                x1, y1, x2, y2, pad, pos_badge,
+                pos_idx, status_md
+            )
+
+        btn_curate_next.click(
+            fn=_on_curate_next,
+            inputs=[],
+            outputs=[
+                curate_crop_image, curate_full_frame, curate_info_md, curate_class_dropdown,
+                curate_x1, curate_y1, curate_x2, curate_y2, curate_padding_slider,
+                curate_pos_indicator_md, curate_jump_dropdown, curate_status_md
+            ]
+        )
+
+        def _on_curate_random():
+            df = _CURATE_STATE.get("df")
+            import random
+            target = random.randint(0, len(df) - 1) if df is not None and len(df) > 0 else 0
+            crop_rgb, html, info_md, cname, x1, y1, x2, y2, pad, pos_badge, pos_idx, status_md = get_curate_defect_display(target)
+            return (
+                crop_rgb, html, info_md, cname,
+                x1, y1, x2, y2, pad, pos_badge,
+                pos_idx, status_md
+            )
+
+        btn_curate_random.click(
+            fn=_on_curate_random,
+            inputs=[],
+            outputs=[
+                curate_crop_image, curate_full_frame, curate_info_md, curate_class_dropdown,
+                curate_x1, curate_y1, curate_x2, curate_y2, curate_padding_slider,
+                curate_pos_indicator_md, curate_jump_dropdown, curate_status_md
+            ]
+        )
+
+        def _on_curate_padding_change(pad):
+            crop_rgb, html, x1, y1, x2, y2 = curate_adjust_padding(pad)
+            return crop_rgb, html, x1, y1, x2, y2
+
+        curate_padding_slider.change(
+            fn=_on_curate_padding_change,
+            inputs=[curate_padding_slider],
+            outputs=[curate_crop_image, curate_full_frame, curate_x1, curate_y1, curate_x2, curate_y2]
+        )
+
+        def _on_curate_coords_change(x1, y1, x2, y2):
+            crop_rgb, html = curate_apply_coords(x1, y1, x2, y2)
+            return crop_rgb, html
+
+        gr.on(
+            triggers=[curate_x1.change, curate_y1.change, curate_x2.change, curate_y2.change],
+            fn=_on_curate_coords_change,
+            inputs=[curate_x1, curate_y1, curate_x2, curate_y2],
+            outputs=[curate_crop_image, curate_full_frame]
+        )
+
+        def _on_curate_reset():
+            crop_rgb, html, x1, y1, x2, y2, pad = curate_reset_bbox()
+            return crop_rgb, html, x1, y1, x2, y2, pad
+
+        btn_curate_reset_box.click(
+            fn=_on_curate_reset,
+            inputs=[],
+            outputs=[
+                curate_crop_image, curate_full_frame,
+                curate_x1, curate_y1, curate_x2, curate_y2, curate_padding_slider
+            ]
+        )
+
+        def _on_curate_save(chosen_class, x1, y1, x2, y2):
+            crop_rgb, html, info_md, cname, rx1, ry1, rx2, ry2, pad, pos_badge, pos_idx, status_md, stats_md = curate_save_changes(chosen_class, x1, y1, x2, y2)
+            df = _CURATE_STATE.get("df")
+            choices = []
+            if df is not None:
+                for i, r in df.iterrows():
+                    cn = r.get("class_name", "")
+                    img_name = str(r.get("image_name", ""))
+                    short_img = img_name[:24] + "..." if len(img_name) > 24 else img_name
+                    choices.append((f"#{i+1}: [{cn}] {short_img} ({r.get('split', '')})", i))
+            return (
+                crop_rgb, html, info_md, cname,
+                rx1, ry1, rx2, ry2, pad, pos_badge,
+                gr.Dropdown(choices=choices, value=pos_idx),
+                status_md,
+                stats_md
+            )
+
+        btn_curate_save.click(
+            fn=_on_curate_save,
+            inputs=[curate_class_dropdown, curate_x1, curate_y1, curate_x2, curate_y2],
+            outputs=[
+                curate_crop_image, curate_full_frame, curate_info_md, curate_class_dropdown,
+                curate_x1, curate_y1, curate_x2, curate_y2, curate_padding_slider,
+                curate_pos_indicator_md, curate_jump_dropdown, curate_status_md,
+                ds_stats_md
+            ]
+        )
+
+        def _on_curate_delete():
+            crop_rgb, html, info_md, cname, rx1, ry1, rx2, ry2, pad, pos_badge, pos_idx, status_md, stats_md = curate_delete_defect()
+            df = _CURATE_STATE.get("df")
+            choices = []
+            if df is not None:
+                for i, r in df.iterrows():
+                    cn = r.get("class_name", "")
+                    img_name = str(r.get("image_name", ""))
+                    short_img = img_name[:24] + "..." if len(img_name) > 24 else img_name
+                    choices.append((f"#{i+1}: [{cn}] {short_img} ({r.get('split', '')})", i))
+            return (
+                crop_rgb, html, info_md, cname,
+                rx1, ry1, rx2, ry2, pad, pos_badge,
+                gr.Dropdown(choices=choices, value=pos_idx),
+                status_md,
+                stats_md
+            )
+
+        btn_curate_delete.click(
+            fn=_on_curate_delete,
+            inputs=[],
+            outputs=[
+                curate_crop_image, curate_full_frame, curate_info_md, curate_class_dropdown,
+                curate_x1, curate_y1, curate_x2, curate_y2, curate_padding_slider,
+                curate_pos_indicator_md, curate_jump_dropdown, curate_status_md,
+                ds_stats_md
+            ]
+        )
+
     return demo, theme, custom_css
 
 
 if __name__ == "__main__":
     app, theme, css = build_ui()
-    print("[RDD-YOLO] Launching Gradio Web UI on http://127.0.0.1:7860 ...")
-    app.launch(
-        server_name="127.0.0.1",
-        server_port=7860,
-        share=False,
-        theme=theme,
-        css=css,
-        allowed_paths=[OUTPUTS_DIR, BASE_DIR]
-    )
+    target_port = int(os.environ.get("GRADIO_SERVER_PORT", 7860))
+    print(f"[RDD-YOLO] Launching Gradio Web UI on http://127.0.0.1:{target_port} ...")
+    try:
+        app.launch(
+            server_name="127.0.0.1",
+            server_port=target_port,
+            share=False,
+            theme=theme,
+            css=css,
+            allowed_paths=[OUTPUTS_DIR, BASE_DIR]
+        )
+    except OSError:
+        print(f"[RDD-YOLO] Port {target_port} occupied. Automatically searching for next available port...")
+        app.launch(
+            server_name="127.0.0.1",
+            share=False,
+            theme=theme,
+            css=css,
+            allowed_paths=[OUTPUTS_DIR, BASE_DIR]
+        )
+
 
 
