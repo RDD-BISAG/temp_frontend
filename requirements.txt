@@ -1,0 +1,11 @@
+gradio>=4.0.0
+opencv-python>=4.8.0
+numpy>=1.24.0
+pandas>=2.0.0
+requests>=2.31.0
+psutil>=5.9.0
+torch>=2.2.0
+ultralytics>=8.0.0
+imageio>=2.31.0
+imageio-ffmpeg>=0.4.9
+PyYAML>=6.0.0
